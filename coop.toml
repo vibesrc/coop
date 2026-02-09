@@ -1,0 +1,13 @@
+[sandbox]
+image = "debian:latest"
+command = "bash"
+user = "coop"
+
+setup = [
+  "DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y bash curl git ca-certificates"
+  # "curl -fsSL https://claude.ai/install.sh | bash"
+]
+
+mounts = [
+  "~/.claude:~/.claude",
+]
