@@ -93,7 +93,7 @@ impl DaemonClient {
             );
         }
         if let Some(session) = &resp.data.session {
-            println!("Session '{}' created", session);
+            println!("Box '{}' created", session);
         }
         Ok(())
     }
@@ -151,6 +151,53 @@ impl DaemonClient {
         self.enter_stream_mode(session, pty).await
     }
 
+    pub async fn shell_or_create(
+        mut self,
+        name: Option<&str>,
+        workspace: &str,
+        command: Option<&str>,
+    ) -> Result<()> {
+        // Try create (ignored if already exists)
+        let cmd = Command::Create {
+            name: name.map(|s| s.to_string()),
+            workspace: workspace.to_string(),
+            coopfile: None,
+            detach: false,
+        };
+        let resp = self.send_command(&cmd).await?;
+
+        let session_name = if resp.ok {
+            // Box just created
+            resp.data.session.unwrap_or_else(|| {
+                name.map(|s| s.to_string()).unwrap_or_else(|| {
+                    std::path::Path::new(workspace)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                })
+            })
+        } else if resp.error.as_deref() == Some("SESSION_EXISTS") {
+            // Box already running
+            resp.data.session.unwrap_or_else(|| {
+                name.map(|s| s.to_string()).unwrap_or_else(|| {
+                    std::path::Path::new(workspace)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                })
+            })
+        } else {
+            bail!(
+                "Failed to create box: {}",
+                resp.message.unwrap_or_default()
+            );
+        };
+
+        self.shell(&session_name, command).await
+    }
+
     pub async fn shell(mut self, session: &str, command: Option<&str>) -> Result<()> {
         let (cols, rows) = terminal_size();
         let cmd = Command::Shell {
@@ -180,11 +227,11 @@ impl DaemonClient {
             if json {
                 println!("{}", serde_json::to_string_pretty(sessions)?);
             } else if sessions.is_empty() {
-                println!("No running sessions.");
+                println!("No running boxes.");
             } else {
                 println!(
                     "{:<12} {:<30} {:<10} {:<6} {:<15} {}",
-                    "SESSION", "WORKSPACE", "STATE", "PTYS", "CLIENTS", "AGE"
+                    "BOX", "WORKSPACE", "STATE", "PTYS", "CLIENTS", "AGE"
                 );
                 for s in sessions {
                     println!(
@@ -212,7 +259,7 @@ impl DaemonClient {
         if !resp.ok {
             bail!("Failed to kill session: {}", resp.message.unwrap_or_default());
         }
-        println!("Session '{}' killed", session);
+        println!("Box '{}' killed", session);
         Ok(())
     }
 
@@ -226,7 +273,94 @@ impl DaemonClient {
         if !resp.ok {
             bail!("Failed to kill sessions: {}", resp.message.unwrap_or_default());
         }
-        println!("All sessions killed");
+        println!("All boxes killed");
+        Ok(())
+    }
+
+    pub async fn session_ls_all(mut self) -> Result<()> {
+        let resp = self.send_command(&Command::Ls).await?;
+        if !resp.ok {
+            bail!(
+                "Failed to list sessions: {}",
+                resp.message.unwrap_or_default()
+            );
+        }
+
+        if let Some(sessions) = &resp.data.sessions {
+            if sessions.is_empty() {
+                println!("No running boxes.");
+            } else {
+                println!(
+                    "{:<12} {:<6} {:<8} {:<20} {}",
+                    "BOX", "ID", "ROLE", "COMMAND", "PID"
+                );
+                for s in sessions {
+                    for p in &s.ptys {
+                        let pid_str = p
+                            .pid
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        let role = match p.role {
+                            crate::ipc::PtyRole::Agent => "agent",
+                            crate::ipc::PtyRole::Shell => "shell",
+                        };
+                        println!(
+                            "{:<12} {:<6} {:<8} {:<20} {}",
+                            s.name, p.id, role, p.command, pid_str
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn session_ls(mut self, box_name: &str) -> Result<()> {
+        let cmd = Command::SessionLs {
+            session: box_name.to_string(),
+        };
+        let resp = self.send_command(&cmd).await?;
+        if !resp.ok {
+            bail!(
+                "Failed to list sessions: {}",
+                resp.message.unwrap_or_default()
+            );
+        }
+
+        if let Some(ptys) = &resp.data.ptys {
+            if ptys.is_empty() {
+                println!("No sessions in box '{}'.", box_name);
+            } else {
+                println!("{:<6} {:<8} {:<20} {}", "ID", "ROLE", "COMMAND", "PID");
+                for p in ptys {
+                    let pid_str = p
+                        .pid
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let role = match p.role {
+                        crate::ipc::PtyRole::Agent => "agent",
+                        crate::ipc::PtyRole::Shell => "shell",
+                    };
+                    println!("{:<6} {:<8} {:<20} {}", p.id, role, p.command, pid_str);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn session_kill(mut self, session: &str, pty: u32) -> Result<()> {
+        let cmd = Command::SessionKill {
+            session: session.to_string(),
+            pty,
+        };
+        let resp = self.send_command(&cmd).await?;
+        if !resp.ok {
+            bail!(
+                "Failed to kill PTY session: {}",
+                resp.message.unwrap_or_default()
+            );
+        }
+        println!("PTY {} in box '{}' killed", pty, session);
         Ok(())
     }
 

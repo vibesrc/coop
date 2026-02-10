@@ -8,7 +8,7 @@ use anyhow::{bail, Result};
 use bytes::Bytes;
 use tokio::sync::{broadcast, Mutex, RwLock};
 
-use crate::config::{self, Coopfile};
+use crate::config::{self, Coopfile, NetworkMode};
 use crate::ipc::{
     PtyInfo, PtyRole, Response, ResponseData, SessionInfo, ERR_SESSION_EXISTS,
     ERR_SESSION_NOT_FOUND,
@@ -43,6 +43,18 @@ pub struct Session {
     pub ptys: Vec<PtyState>,
     pub local_clients: u32,
     pub web_clients: u32,
+    /// Default shell command from config
+    pub default_shell: String,
+    /// Whether the session's network is isolated
+    pub network_isolated: bool,
+    /// Home directory inside the sandbox
+    pub sandbox_home: String,
+    /// Sandbox user name
+    pub sandbox_user: String,
+    /// User-defined env vars from config
+    pub user_env: Vec<(String, String)>,
+    /// Workspace path inside the sandbox (e.g. /workspace)
+    pub sandbox_workspace: String,
 }
 
 impl Session {
@@ -59,6 +71,7 @@ impl Session {
                     id: p.id,
                     role: p.role.clone(),
                     command: p.command.clone(),
+                    pid: p.pid,
                 })
                 .collect(),
             web_clients: self.web_clients,
@@ -70,6 +83,75 @@ impl Session {
 /// Manages all active sessions.
 pub struct SessionManager {
     sessions: RwLock<HashMap<String, Session>>,
+}
+
+/// Spawn a persistent PTY reader task that reads from master_fd, broadcasts
+/// output to all subscribers, and appends to the scrollback buffer.
+fn spawn_pty_reader(
+    master_fd: RawFd,
+    output_tx: broadcast::Sender<Bytes>,
+    scrollback: Arc<Mutex<Vec<u8>>>,
+) {
+    // Set non-blocking so AsyncFd works
+    unsafe {
+        let flags = nix::libc::fcntl(master_fd, nix::libc::F_GETFL);
+        nix::libc::fcntl(master_fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK);
+    }
+
+    tokio::spawn(async move {
+        let mut buf = [0u8; 4096];
+        let async_fd = match tokio::io::unix::AsyncFd::new(master_fd) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to create AsyncFd for PTY master");
+                return;
+            }
+        };
+
+        loop {
+            let mut guard = match async_fd.readable().await {
+                Ok(g) => g,
+                Err(_) => break,
+            };
+
+            match guard.try_io(|inner| {
+                let fd = inner.as_raw_fd();
+                let n = unsafe {
+                    nix::libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len())
+                };
+                if n < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else if n == 0 {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "PTY EOF",
+                    ))
+                } else {
+                    Ok(n as usize)
+                }
+            }) {
+                Ok(Ok(n)) => {
+                    let data = Bytes::copy_from_slice(&buf[..n]);
+
+                    // Append to scrollback buffer
+                    {
+                        let mut sb = scrollback.lock().await;
+                        sb.extend_from_slice(&buf[..n]);
+                        // Trim to max size (keep the tail)
+                        if sb.len() > SCROLLBACK_MAX {
+                            let excess = sb.len() - SCROLLBACK_MAX;
+                            sb.drain(..excess);
+                        }
+                    }
+
+                    // Broadcast to any connected clients (ignore if none)
+                    let _ = output_tx.send(data);
+                }
+                Ok(Err(_)) => break, // EOF or error
+                Err(_would_block) => continue,
+            }
+        }
+    });
 }
 
 impl SessionManager {
@@ -110,6 +192,12 @@ impl SessionManager {
                     ptys: vec![],
                     local_clients: 0,
                     web_clients: 0,
+                    default_shell: "/bin/bash".to_string(),
+                    network_isolated: false,
+                    sandbox_home: "/home/coop".to_string(),
+                    sandbox_user: "coop".to_string(),
+                    user_env: vec![],
+                    sandbox_workspace: "/workspace".to_string(),
                 },
             );
         }
@@ -183,8 +271,7 @@ impl SessionManager {
 
         let agent_cmd = config
             .sandbox
-            .command
-            .as_deref()
+            .agent_command()
             .unwrap_or("claude")
             .to_string();
 
@@ -196,74 +283,15 @@ impl SessionManager {
         let (output_tx, _) = broadcast::channel(256);
         let scrollback = Arc::new(Mutex::new(Vec::new()));
 
-        // Spawn persistent PTY reader that runs for the lifetime of the session.
-        // This ensures output is captured even when no client is attached.
         let master_fd = ns_result.pty_master_fd;
-        {
-            let output_tx_clone = output_tx.clone();
-            let scrollback_clone = scrollback.clone();
+        spawn_pty_reader(master_fd, output_tx.clone(), scrollback.clone());
 
-            // Set non-blocking so AsyncFd works
-            unsafe {
-                let flags = nix::libc::fcntl(master_fd, nix::libc::F_GETFL);
-                nix::libc::fcntl(master_fd, nix::libc::F_SETFL, flags | nix::libc::O_NONBLOCK);
-            }
-
-            tokio::spawn(async move {
-                let mut buf = [0u8; 4096];
-                let async_fd = match tokio::io::unix::AsyncFd::new(master_fd) {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!(error = %e, "Failed to create AsyncFd for PTY master");
-                        return;
-                    }
-                };
-
-                loop {
-                    let mut guard = match async_fd.readable().await {
-                        Ok(g) => g,
-                        Err(_) => break,
-                    };
-
-                    match guard.try_io(|inner| {
-                        let fd = inner.as_raw_fd();
-                        let n = unsafe {
-                            nix::libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len())
-                        };
-                        if n < 0 {
-                            Err(std::io::Error::last_os_error())
-                        } else if n == 0 {
-                            Err(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "PTY EOF",
-                            ))
-                        } else {
-                            Ok(n as usize)
-                        }
-                    }) {
-                        Ok(Ok(n)) => {
-                            let data = Bytes::copy_from_slice(&buf[..n]);
-
-                            // Append to scrollback buffer
-                            {
-                                let mut sb = scrollback_clone.lock().await;
-                                sb.extend_from_slice(&buf[..n]);
-                                // Trim to max size (keep the tail)
-                                if sb.len() > SCROLLBACK_MAX {
-                                    let excess = sb.len() - SCROLLBACK_MAX;
-                                    sb.drain(..excess);
-                                }
-                            }
-
-                            // Broadcast to any connected clients (ignore if none)
-                            let _ = output_tx_clone.send(data);
-                        }
-                        Ok(Err(_)) => break, // EOF or error
-                        Err(_would_block) => continue,
-                    }
-                }
-            });
-        }
+        let sandbox_user = config.sandbox.user.clone();
+        let sandbox_home = format!("/home/{}", sandbox_user);
+        let network_isolated = config.network.mode != NetworkMode::Host;
+        let default_shell = config.sandbox.shell_command().to_string();
+        let sandbox_workspace = config.workspace.path.clone();
+        let user_env: Vec<(String, String)> = config.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         let session = Session {
             name: name.clone(),
@@ -281,6 +309,12 @@ impl SessionManager {
             }],
             local_clients: 0,
             web_clients: 0,
+            default_shell,
+            network_isolated,
+            sandbox_home,
+            sandbox_user,
+            user_env,
+            sandbox_workspace,
         };
 
         tracing::info!(
@@ -333,24 +367,100 @@ impl SessionManager {
             anyhow::anyhow!("Session '{}' not found", session_name)
         })?;
 
-        let cmd = command.unwrap_or_else(|| "/bin/sh".to_string());
+        let cmd = command.unwrap_or_else(|| session.default_shell.clone());
         let pty_id = session.ptys.len() as u32;
 
-        let (output_tx, _) = broadcast::channel(256);
+        let env_vars = session.user_env.clone();
+        let ns_pid = session.namespace_pid;
+        let network_isolated = session.network_isolated;
+        let sandbox_user = session.sandbox_user.clone();
+        let sandbox_home = session.sandbox_home.clone();
+        let sandbox_workspace = session.sandbox_workspace.clone();
 
-        // TODO: actually nsenter and forkpty
+        let shell_ns = namespace::nsenter_shell(
+            ns_pid,
+            &cmd,
+            &env_vars,
+            network_isolated,
+            &sandbox_user,
+            &sandbox_home,
+            &sandbox_workspace,
+        )?;
+
+        let (output_tx, _) = broadcast::channel(256);
+        let scrollback = Arc::new(Mutex::new(Vec::new()));
+
+        spawn_pty_reader(shell_ns.pty_master_fd, output_tx.clone(), scrollback.clone());
+
         session.ptys.push(PtyState {
             id: pty_id,
             role: PtyRole::Shell,
             command: cmd,
-            pid: None,
-            master_fd: None,
+            pid: Some(shell_ns.shell_pid),
+            master_fd: Some(shell_ns.pty_master_fd),
             output_tx: Some(output_tx),
-            scrollback: None,
+            scrollback: Some(scrollback),
         });
 
         Ok(Response::ok_with(ResponseData {
             pty: Some(pty_id),
+            ..Default::default()
+        }))
+    }
+
+    /// Kill a specific PTY session within a box
+    pub async fn kill_pty(&self, session_name: &str, pty_id: u32) -> Result<Response> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(session_name).ok_or_else(|| {
+            anyhow::anyhow!("Session '{}' not found", session_name)
+        })?;
+
+        let pty_idx = session
+            .ptys
+            .iter()
+            .position(|p| p.id == pty_id)
+            .ok_or_else(|| anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name))?;
+
+        let pty = &session.ptys[pty_idx];
+
+        // Send SIGTERM to the shell process
+        if let Some(pid) = pty.pid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+
+        // Close master fd
+        if let Some(fd) = pty.master_fd {
+            unsafe { nix::libc::close(fd) };
+        }
+
+        // Remove from the ptys list
+        session.ptys.remove(pty_idx);
+
+        tracing::info!(session = %session_name, pty = pty_id, "Killed PTY session");
+        Ok(Response::ok())
+    }
+
+    /// List PTY sessions within a specific box
+    pub async fn session_ls(&self, session_name: &str) -> Result<Response> {
+        let sessions = self.sessions.read().await;
+        let session = self.resolve_session(&sessions, session_name)?;
+        let ptys: Vec<crate::ipc::PtyInfo> = session
+            .ptys
+            .iter()
+            .map(|p| crate::ipc::PtyInfo {
+                id: p.id,
+                role: p.role.clone(),
+                command: p.command.clone(),
+                pid: p.pid,
+            })
+            .collect();
+
+        Ok(Response::ok_with(ResponseData {
+            session: Some(session.name.clone()),
+            ptys: Some(ptys),
             ..Default::default()
         }))
     }

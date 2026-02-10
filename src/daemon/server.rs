@@ -281,6 +281,12 @@ async fn handle_client(
                     ..Default::default()
                 }))
             }
+            Command::SessionLs { session } => {
+                session_manager.session_ls(&session).await
+            }
+            Command::SessionKill { session, pty } => {
+                session_manager.kill_pty(&session, pty).await
+            }
             Command::Shutdown => {
                 let _ = shutdown_tx.send(());
                 Ok(Response::ok())

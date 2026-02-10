@@ -1,13 +1,15 @@
 [sandbox]
 image = "debian:latest"
-command = "bash"
+agent = "bash"
+shell = "bash"
 user = "coop"
 
 setup = [
-  "DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y bash curl git ca-certificates"
-  # "curl -fsSL https://claude.ai/install.sh | bash"
+  "DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y bash curl git ca-certificates",
 ]
 
-mounts = [
-  "~/.claude:~/.claude",
+volumes = [
+  "~/.bashrc:~/.bashrc",       # for bash configuration
+  "~/.local/bin:~/.local/bin", # use local claude binary if available
+  "claude-config:~/.claude",   # for claude configuration
 ]

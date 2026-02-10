@@ -91,8 +91,7 @@ pub fn create_session(
     // Resolve the agent command before forking
     let agent_cmd = config
         .sandbox
-        .command
-        .as_deref()
+        .agent_command()
         .unwrap_or("claude");
     let agent_args = &config.sandbox.args;
     let workspace_path = &config.workspace.path;
@@ -139,12 +138,89 @@ pub fn create_session(
         .collect();
 
     // Auto-mount the agent command binary into the sandbox if it exists on the host
-    if let Some(cmd_name) = &config.sandbox.command {
+    if let Some(cmd_name) = config.sandbox.agent_command() {
         if let Ok(host_path) = resolve_host_binary(cmd_name) {
             let container_path = format!("/usr/local/bin/{}", cmd_name);
             extra_mounts.push((host_path, container_path));
         }
     }
+
+    // Resolve volumes
+    let session_volumes_dir = session_dir.join("volumes");
+    std::fs::create_dir_all(&session_volumes_dir)?;
+    let global_volumes_dir = config::coop_dir()?.join("volumes");
+    std::fs::create_dir_all(&global_volumes_dir)?;
+
+    let volume_mounts: Vec<(PathBuf, String)> = config
+        .sandbox
+        .volumes
+        .iter()
+        .filter_map(|m| {
+            let container_path = match m.container_path(&sandbox_home) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("coop: warning: skipping invalid volume: {}", e);
+                    return None;
+                }
+            };
+
+            if m.is_named_volume() {
+                // Named volume: stored globally in ~/.coop/volumes/<name>/
+                let vol_name = m.volume_name().unwrap();
+                let vol_dir = global_volumes_dir.join(&vol_name);
+
+                if !vol_dir.exists() {
+                    // Seed from host path equivalent to container path (e.g., ~/.claude)
+                    let host_equivalent = shellexpand::tilde(
+                        &container_path.replace(&sandbox_home, "~")
+                    ).to_string();
+                    let host_path = PathBuf::from(&host_equivalent);
+
+                    if host_path.exists() && host_path.is_dir() {
+                        if let Err(e) = copy_dir_recursive(&host_path, &vol_dir) {
+                            eprintln!("coop: warning: failed to seed volume '{}' from {}: {}", vol_name, host_path.display(), e);
+                            let _ = std::fs::create_dir_all(&vol_dir);
+                        }
+                    } else {
+                        let _ = std::fs::create_dir_all(&vol_dir);
+                    }
+                }
+
+                Some((vol_dir, container_path))
+            } else {
+                // Host-seeded volume: stored per-session
+                match m.resolve_with_home(&sandbox_home) {
+                    Ok((host_src, container_path)) => {
+                        let vol_name = container_path.trim_matches('/').replace('/', "--");
+                        let vol_path = session_volumes_dir.join(&vol_name);
+
+                        if !vol_path.exists() {
+                            if host_src.is_dir() {
+                                // Directory volume: vol_path becomes a directory
+                                if let Err(e) = copy_dir_recursive(&host_src, &vol_path) {
+                                    eprintln!("coop: warning: failed to seed volume from {}: {}", host_src.display(), e);
+                                    let _ = std::fs::create_dir_all(&vol_path);
+                                }
+                            } else if host_src.is_file() {
+                                // File volume: vol_path becomes the file itself (not a directory)
+                                let _ = std::fs::copy(&host_src, &vol_path);
+                            } else {
+                                // Source doesn't exist: create empty file placeholder
+                                let _ = std::fs::write(&vol_path, b"");
+                            }
+                        }
+
+                        Some((vol_path, container_path))
+                    }
+                    Err(e) => {
+                        eprintln!("coop: warning: skipping invalid volume: {}", e);
+                        None
+                    }
+                }
+            }
+        })
+        .collect();
+
     let sandbox_user_owned = sandbox_user.clone();
     let sandbox_home_owned = sandbox_home.clone();
     let user_env_owned = user_env.clone();
@@ -220,6 +296,10 @@ pub fn create_session(
 
             // Now we are "root" inside the user namespace.
             // Set up the filesystem.
+            // Combine regular mounts and volume mounts
+            let mut all_mounts = extra_mounts.clone();
+            all_mounts.extend(volume_mounts.iter().cloned());
+
             if let Err(e) = child_setup_fs(
                 &base_path_owned,
                 &upper_path_owned,
@@ -229,7 +309,7 @@ pub fn create_session(
                 &workspace_path_owned,
                 &persist_dirs_owned,
                 &persist_path_owned,
-                &extra_mounts,
+                &all_mounts,
                 &sandbox_user_owned,
                 &sandbox_home_owned,
             ) {
@@ -243,63 +323,23 @@ pub fn create_session(
                 // Non-fatal
             }
 
-            // Set environment variables
+            // Set coop-specific env before the shared entrypoint
             std::env::set_var("COOP_SESSION", &name_owned);
             std::env::set_var("COOP_WORKSPACE", &workspace_host_owned);
             std::env::set_var("COOP_CREATED", now.to_string());
-            std::env::set_var("HOME", &sandbox_home_owned);
-            std::env::set_var("USER", &sandbox_user_owned);
-            std::env::set_var("PATH", format!(
-                "{}/.claude/local/bin:{}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                sandbox_home_owned, sandbox_home_owned
-            ));
-            std::env::set_var("TERM", "xterm-256color");
 
-            for (k, v) in &user_env_owned {
-                std::env::set_var(k, v);
-            }
+            // Build env vars vec for entrypoint
+            let env_vars: Vec<(String, String)> = user_env_owned.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
-            // Redirect stdin/stdout/stderr to the slave PTY
-            unsafe {
-                nix::libc::setsid();
-                nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY as _, 0);
-                nix::libc::dup2(slave_fd, 0);
-                nix::libc::dup2(slave_fd, 1);
-                nix::libc::dup2(slave_fd, 2);
-                if slave_fd > 2 {
-                    nix::libc::close(slave_fd);
-                }
-            }
-
-            // Set working directory to workspace inside the namespace
-            let _ = std::env::set_current_dir(&workspace_path_owned);
-
-            // Exec the agent command
-            let cmd = CString::new(agent_cmd_owned.as_str())
-                .unwrap_or_else(|_| CString::new("/bin/sh").unwrap());
-
-            let mut argv: Vec<CString> = vec![cmd.clone()];
-            for arg in &agent_args_owned {
-                if let Ok(a) = CString::new(arg.as_str()) {
-                    argv.push(a);
-                }
-            }
-
-            // Collect environment for exec
-            let env: Vec<CString> = std::env::vars()
-                .filter_map(|(k, v)| CString::new(format!("{}={}", k, v)).ok())
-                .collect();
-
-            // execvpe
-            let _ = nix::unistd::execvpe(&cmd, &argv, &env);
-
-            // If exec fails, try /bin/sh as fallback
-            let sh = CString::new("/bin/sh").unwrap();
-            let sh_args = [sh.clone(), CString::new("-c").unwrap(), cmd];
-            let _ = nix::unistd::execvpe(&sh, &sh_args, &env);
-
-            eprintln!("coop: exec failed");
-            std::process::exit(1);
+            child_entrypoint(
+                slave_fd,
+                &agent_cmd_owned,
+                &agent_args_owned,
+                &env_vars,
+                &sandbox_user_owned,
+                &sandbox_home_owned,
+                &workspace_path_owned,
+            );
         }
     }
 }
@@ -450,19 +490,36 @@ pub fn setup_overlay(
     std::fs::create_dir_all(work_path)?;
     std::fs::create_dir_all(mount_point)?;
 
-    let options = format!(
+    // Try with redirect_dir=on (fixes rename across layers for dpkg/apt),
+    // fall back to basic options if kernel doesn't support it
+    let base = format!(
         "lowerdir={},upperdir={},workdir={}",
         base_path.display(),
         upper_path.display(),
         work_path.display()
     );
 
+    let options_with_redirect = format!("{},redirect_dir=on", base);
+
+    let result = nix::mount::mount(
+        Some("overlay"),
+        mount_point,
+        Some("overlay"),
+        nix::mount::MsFlags::empty(),
+        Some(options_with_redirect.as_str()),
+    );
+
+    if result.is_ok() {
+        return Ok(());
+    }
+
+    // Fallback: basic overlayfs without redirect_dir
     nix::mount::mount(
         Some("overlay"),
         mount_point,
         Some("overlay"),
         nix::mount::MsFlags::empty(),
-        Some(options.as_str()),
+        Some(base.as_str()),
     )
     .context("Failed to mount overlayfs")?;
 
@@ -629,6 +686,18 @@ fn setup_sandbox_user(root: &Path, user: &str, home: &str) -> Result<()> {
 
     std::fs::write(etc.join("shadow"), format!("{user}:!:0::::::\n"))?;
 
+    // Hostname resolution (needed for OAuth callbacks, localhost binding, etc.)
+    std::fs::write(
+        etc.join("hosts"),
+        "127.0.0.1 localhost\n::1 localhost\n",
+    )?;
+
+    // DNS resolution
+    std::fs::write(
+        etc.join("resolv.conf"),
+        "nameserver 8.8.8.8\nnameserver 8.8.4.4\n",
+    )?;
+
     Ok(())
 }
 
@@ -681,6 +750,214 @@ pub fn pivot_root(new_root: &Path) -> Result<()> {
     std::fs::remove_dir("/old_root").ok();
 
     Ok(())
+}
+
+/// Result of nsenter-ing a shell into an existing namespace
+pub struct ShellNamespace {
+    /// PID of the shell process (as seen from host)
+    pub shell_pid: u32,
+    /// Master side of the PTY allocated for the shell
+    pub pty_master_fd: RawFd,
+}
+
+/// Enter an existing session's namespaces and spawn a shell with its own PTY.
+///
+/// Opens the namespace fds and /proc/<pid>/root BEFORE setns(mnt) so we still
+/// have access to host procfs. Uses fchdir+chroot(".") to enter the sandboxed root.
+pub fn nsenter_shell(
+    namespace_pid: u32,
+    shell_cmd: &str,
+    env_vars: &[(String, String)],
+    network_isolated: bool,
+    sandbox_user: &str,
+    sandbox_home: &str,
+    cwd: &str,
+) -> Result<ShellNamespace> {
+    let pid = namespace_pid;
+
+    // Open namespace fds BEFORE fork (while we're on host).
+    // user ns MUST be entered first — can't setns(mnt) into a user
+    // namespace's mount namespace without being in that user namespace.
+    let user_ns = std::fs::File::open(format!("/proc/{}/ns/user", pid))
+        .context("Failed to open user namespace")?;
+    let mnt_ns = std::fs::File::open(format!("/proc/{}/ns/mnt", pid))
+        .context("Failed to open mnt namespace")?;
+    let uts_ns = std::fs::File::open(format!("/proc/{}/ns/uts", pid))
+        .context("Failed to open uts namespace")?;
+    let net_ns = if network_isolated {
+        Some(
+            std::fs::File::open(format!("/proc/{}/ns/net", pid))
+                .context("Failed to open net namespace")?,
+        )
+    } else {
+        None
+    };
+
+    // Open /proc/<pid>/root BEFORE entering mount namespace
+    let root_fd = nix::fcntl::open(
+        format!("/proc/{}/root", pid).as_str(),
+        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_DIRECTORY,
+        nix::sys::stat::Mode::empty(),
+    )
+    .context("Failed to open namespace root")?;
+
+    // Allocate PTY pair
+    let pty = nix::pty::openpty(None, None).context("Failed to allocate PTY for shell")?;
+    let master_fd = pty.master.into_raw_fd();
+    let slave_fd = pty.slave.into_raw_fd();
+
+    let shell_cmd_owned = shell_cmd.to_string();
+    let env_vars_owned: Vec<(String, String)> = env_vars.to_vec();
+    let sandbox_user_owned = sandbox_user.to_string();
+    let sandbox_home_owned = sandbox_home.to_string();
+    let cwd_owned = cwd.to_string();
+
+    match unsafe { nix::unistd::fork() }.context("fork() failed for nsenter_shell")? {
+        ForkResult::Parent { child } => {
+            // Parent: close slave fd and namespace fds
+            unsafe { nix::libc::close(slave_fd) };
+            unsafe { nix::libc::close(root_fd) };
+            drop(user_ns);
+            drop(mnt_ns);
+            drop(uts_ns);
+            drop(net_ns);
+
+            Ok(ShellNamespace {
+                shell_pid: child.as_raw() as u32,
+                pty_master_fd: master_fd,
+            })
+        }
+        ForkResult::Child => {
+            // Child: close master fd
+            unsafe { nix::libc::close(master_fd) };
+
+            // Enter namespaces — user ns FIRST so we have the right
+            // credential context for the other namespace operations
+            if let Err(e) = nix::sched::setns(&user_ns, CloneFlags::CLONE_NEWUSER) {
+                eprintln!("coop: setns(user) failed: {}", e);
+                std::process::exit(1);
+            }
+            if let Err(e) = nix::sched::setns(&mnt_ns, CloneFlags::CLONE_NEWNS) {
+                eprintln!("coop: setns(mnt) failed: {}", e);
+                std::process::exit(1);
+            }
+            if let Err(e) = nix::sched::setns(&uts_ns, CloneFlags::CLONE_NEWUTS) {
+                eprintln!("coop: setns(uts) failed: {}", e);
+                std::process::exit(1);
+            }
+            if let Some(ref ns) = net_ns {
+                if let Err(e) = nix::sched::setns(ns, CloneFlags::CLONE_NEWNET) {
+                    eprintln!("coop: setns(net) failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+
+            // Close namespace fds (no longer needed)
+            drop(user_ns);
+            drop(mnt_ns);
+            drop(uts_ns);
+            drop(net_ns);
+
+            // Enter the sandbox root via fchdir + chroot(".")
+            if unsafe { nix::libc::fchdir(root_fd) } != 0 {
+                eprintln!("coop: fchdir to namespace root failed");
+                std::process::exit(1);
+            }
+            unsafe { nix::libc::close(root_fd) };
+
+            if let Err(e) = nix::unistd::chroot(".") {
+                eprintln!("coop: chroot failed: {}", e);
+                std::process::exit(1);
+            }
+            let _ = std::env::set_current_dir("/");
+
+            child_entrypoint(
+                slave_fd,
+                &shell_cmd_owned,
+                &[],
+                &env_vars_owned,
+                &sandbox_user_owned,
+                &sandbox_home_owned,
+                &cwd_owned,
+            );
+        }
+    }
+}
+
+/// Common child-side entrypoint: set up PTY as controlling terminal,
+/// configure environment, and exec the command. Does not return on success.
+fn child_entrypoint(
+    slave_fd: RawFd,
+    cmd_str: &str,
+    args: &[String],
+    env_vars: &[(String, String)],
+    sandbox_user: &str,
+    sandbox_home: &str,
+    cwd: &str,
+) -> ! {
+    // Set up PTY as controlling terminal
+    unsafe {
+        nix::libc::setsid();
+        nix::libc::ioctl(slave_fd, nix::libc::TIOCSCTTY as _, 0);
+        nix::libc::dup2(slave_fd, 0);
+        nix::libc::dup2(slave_fd, 1);
+        nix::libc::dup2(slave_fd, 2);
+        if slave_fd > 2 {
+            nix::libc::close(slave_fd);
+        }
+    }
+
+    // Set environment
+    std::env::set_var("HOME", sandbox_home);
+    std::env::set_var("USER", sandbox_user);
+    std::env::set_var("TERM", "xterm-256color");
+    std::env::set_var(
+        "PATH",
+        format!(
+            "{}/.claude/local/bin:{}/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            sandbox_home, sandbox_home
+        ),
+    );
+    for (k, v) in env_vars {
+        std::env::set_var(k, v);
+    }
+
+    // Set working directory
+    let _ = std::env::set_current_dir(cwd);
+
+    // Exec the command
+    let cmd = CString::new(cmd_str)
+        .unwrap_or_else(|_| CString::new("/bin/sh").unwrap());
+
+    let mut argv: Vec<CString> = vec![cmd.clone()];
+    if args.is_empty() {
+        // No explicit args — if it's a shell, run as login shell so
+        // .bashrc / .profile get sourced (same experience as the agent)
+        let base = cmd_str.rsplit('/').next().unwrap_or(cmd_str);
+        if matches!(base, "bash" | "sh" | "zsh" | "fish") {
+            argv.push(CString::new("-l").unwrap());
+        }
+    } else {
+        for arg in args {
+            if let Ok(a) = CString::new(arg.as_str()) {
+                argv.push(a);
+            }
+        }
+    }
+
+    let env: Vec<CString> = std::env::vars()
+        .filter_map(|(k, v)| CString::new(format!("{}={}", k, v)).ok())
+        .collect();
+
+    let _ = nix::unistd::execvpe(&cmd, &argv, &env);
+
+    // Fallback: try /bin/sh -c
+    let sh = CString::new("/bin/sh").unwrap();
+    let sh_args = [sh.clone(), CString::new("-c").unwrap(), cmd];
+    let _ = nix::unistd::execvpe(&sh, &sh_args, &env);
+
+    eprintln!("coop: exec failed");
+    std::process::exit(1);
 }
 
 /// Kill a session by sending SIGTERM to its namespace init process,
@@ -785,4 +1062,23 @@ fn resolve_host_binary(cmd: &str) -> Result<PathBuf> {
         .with_context(|| format!("Failed to resolve real path of {}", path_str))?;
 
     Ok(real_path)
+}
+
+/// Recursively copy a directory tree.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)
+        .with_context(|| format!("Failed to read directory {}", src.display()))?
+    {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)
+                .with_context(|| format!("Failed to copy {}", src_path.display()))?;
+        }
+    }
+    Ok(())
 }

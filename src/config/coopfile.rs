@@ -50,15 +50,37 @@ impl Default for WorkspaceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     pub image: Option<String>,
+    /// Deprecated: use `agent` instead. Kept for backwards compat.
+    #[serde(skip_serializing)]
     pub command: Option<String>,
+    /// The agent process command (the main long-running process in the box)
+    pub agent: Option<String>,
+    /// The shell command for `coop shell` sessions (default: /bin/bash)
+    pub shell: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
     pub setup: Vec<String>,
     #[serde(default = "default_user")]
     pub user: String,
+    /// Direct bind mounts (host path mounted read-write into sandbox)
     #[serde(default)]
     pub mounts: Vec<MountConfig>,
+    /// Volume mounts (copied from host on first use, persisted per-session)
+    #[serde(default)]
+    pub volumes: Vec<MountConfig>,
+}
+
+impl SandboxConfig {
+    /// Resolve the agent command: `agent` > `command` > None
+    pub fn agent_command(&self) -> Option<&str> {
+        self.agent.as_deref().or(self.command.as_deref())
+    }
+
+    /// Resolve the shell command: `shell` > "/bin/bash"
+    pub fn shell_command(&self) -> &str {
+        self.shell.as_deref().unwrap_or("/bin/bash")
+    }
 }
 
 impl Default for SandboxConfig {
@@ -66,10 +88,13 @@ impl Default for SandboxConfig {
         Self {
             image: None,
             command: None,
+            agent: None,
+            shell: None,
             args: Vec::new(),
             setup: Vec::new(),
             user: default_user(),
             mounts: Vec::new(),
+            volumes: Vec::new(),
         }
     }
 }
@@ -92,6 +117,49 @@ impl MountConfig {
             format!("{}/{}", sandbox_home, rest)
         } else {
             path.to_string()
+        }
+    }
+
+    /// Check if the left side looks like a path (starts with /, ~, or .)
+    fn is_path(s: &str) -> bool {
+        s.starts_with('/') || s.starts_with('~') || s.starts_with('.')
+    }
+
+    /// Check if this mount/volume uses a named volume (left side is a name, not a path)
+    pub fn is_named_volume(&self) -> bool {
+        match self {
+            MountConfig::Short(s) => {
+                let left = s.splitn(2, ':').next().unwrap_or("");
+                !Self::is_path(left)
+            }
+            MountConfig::Full { host, .. } => !Self::is_path(host),
+        }
+    }
+
+    /// Get the volume name (for named volumes only)
+    pub fn volume_name(&self) -> Option<String> {
+        if !self.is_named_volume() {
+            return None;
+        }
+        match self {
+            MountConfig::Short(s) => Some(s.splitn(2, ':').next().unwrap_or("").to_string()),
+            MountConfig::Full { host, .. } => Some(host.clone()),
+        }
+    }
+
+    /// Get just the container path (expanded with sandbox home)
+    pub fn container_path(&self, sandbox_home: &str) -> Result<String> {
+        match self {
+            MountConfig::Short(s) => {
+                let parts: Vec<&str> = s.splitn(2, ':').collect();
+                if parts.len() != 2 {
+                    bail!("Invalid format '{}', expected 'source:container'", s);
+                }
+                Ok(Self::expand_container_path(parts[1], sandbox_home))
+            }
+            MountConfig::Full { container, .. } => {
+                Ok(Self::expand_container_path(container, sandbox_home))
+            }
         }
     }
 
@@ -126,7 +194,7 @@ pub enum NetworkMode {
 
 impl Default for NetworkMode {
     fn default() -> Self {
-        NetworkMode::Veth
+        NetworkMode::Host
     }
 }
 
@@ -224,6 +292,12 @@ impl Coopfile {
         if other.sandbox.command.is_some() {
             self.sandbox.command = other.sandbox.command.clone();
         }
+        if other.sandbox.agent.is_some() {
+            self.sandbox.agent = other.sandbox.agent.clone();
+        }
+        if other.sandbox.shell.is_some() {
+            self.sandbox.shell = other.sandbox.shell.clone();
+        }
         if !other.sandbox.args.is_empty() {
             self.sandbox.args = other.sandbox.args.clone();
         }
@@ -235,6 +309,9 @@ impl Coopfile {
         }
         if !other.sandbox.mounts.is_empty() {
             self.sandbox.mounts.extend(other.sandbox.mounts.iter().cloned());
+        }
+        if !other.sandbox.volumes.is_empty() {
+            self.sandbox.volumes.extend(other.sandbox.volumes.iter().cloned());
         }
 
         // Env: additive merge
@@ -306,8 +383,8 @@ impl Coopfile {
 
     /// Validate the Coopfile, returning errors for invalid configuration
     pub fn validate(&self) -> Result<()> {
-        if self.sandbox.command.is_none() {
-            bail!("sandbox.command is required (set it in coop.toml or ~/.config/coop/default.toml)");
+        if self.sandbox.agent_command().is_none() {
+            bail!("sandbox.agent or sandbox.command is required (set it in coop.toml or ~/.config/coop/default.toml)");
         }
         Ok(())
     }
@@ -330,13 +407,23 @@ mod tests {
     fn test_parse_minimal() {
         let toml = r#"
 [sandbox]
-command = "claude"
+agent = "claude"
 image = "node:22-alpine"
 "#;
         let cf = Coopfile::parse(toml).unwrap();
-        assert_eq!(cf.sandbox.command.as_deref(), Some("claude"));
+        assert_eq!(cf.sandbox.agent_command(), Some("claude"));
         assert_eq!(cf.sandbox.image.as_deref(), Some("node:22-alpine"));
-        assert_eq!(cf.network.mode, NetworkMode::Veth);
+        assert_eq!(cf.network.mode, NetworkMode::Host);
+    }
+
+    #[test]
+    fn test_parse_legacy_command() {
+        let toml = r#"
+[sandbox]
+command = "claude"
+"#;
+        let cf = Coopfile::parse(toml).unwrap();
+        assert_eq!(cf.sandbox.agent_command(), Some("claude"));
     }
 
     #[test]
@@ -346,12 +433,12 @@ image = "node:22-alpine"
 
         let mut overlay = Coopfile::default();
         overlay.env.insert("KEY2".into(), "val2".into());
-        overlay.sandbox.command = Some("claude".into());
+        overlay.sandbox.agent = Some("claude".into());
 
         base.merge(&overlay);
         assert_eq!(base.env.get("KEY1").unwrap(), "val1");
         assert_eq!(base.env.get("KEY2").unwrap(), "val2");
-        assert_eq!(base.sandbox.command.as_deref(), Some("claude"));
+        assert_eq!(base.sandbox.agent_command(), Some("claude"));
     }
 
     #[test]
@@ -361,6 +448,6 @@ image = "node:22-alpine"
         assert_eq!(cf.session.restart_delay_ms, 1000);
         assert_eq!(cf.input_filter.ctrl_c_debounce_ms, 500);
         assert_eq!(cf.session.persist, vec![".claude"]);
-        assert_eq!(cf.network.mode, NetworkMode::Veth);
+        assert_eq!(cf.network.mode, NetworkMode::Host);
     }
 }

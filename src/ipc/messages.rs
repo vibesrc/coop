@@ -78,6 +78,15 @@ pub enum Command {
     Tunnel {
         session: String,
     },
+    /// List PTY sessions within a box
+    SessionLs {
+        session: String,
+    },
+    /// Kill a specific PTY session within a box
+    SessionKill {
+        session: String,
+        pty: u32,
+    },
     Shutdown,
     Detach,
 }
@@ -119,6 +128,8 @@ pub struct ResponseData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sessions: Option<Vec<SessionInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub ptys: Option<Vec<PtyInfo>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
@@ -148,6 +159,8 @@ pub struct PtyInfo {
     pub id: u32,
     pub role: PtyRole,
     pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

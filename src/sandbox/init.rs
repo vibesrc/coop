@@ -46,12 +46,16 @@ fn rootfs_is_stale(config: &Coopfile) -> Result<bool> {
 
 /// Ensure the rootfs exists. Builds on first run, warns if config has changed.
 /// Use `coop init`/`coop rebuild` or `coop --build` for explicit rebuilds.
-pub async fn ensure_rootfs(force_build: bool) -> Result<()> {
+pub async fn ensure_rootfs(force_build: bool, no_cache: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let config = Coopfile::resolve(&cwd, None)?;
     let base_path = config::rootfs_base_path()?;
 
-    if force_build {
+    if force_build || no_cache {
+        if no_cache {
+            // Wipe OCI cache too
+            let _ = std::fs::remove_dir_all(config::oci_cache_dir()?);
+        }
         do_build_rootfs(&config).await?;
         return Ok(());
     }
@@ -360,7 +364,7 @@ fn run_in_rootfs(rootfs: &Path, cmd: &str) -> Result<()> {
             }
             let _ = std::env::set_current_dir("/");
 
-            // Mount /proc so package managers work
+            // Mount /proc
             let _ = std::fs::create_dir_all("/proc");
             let _ = nix::mount::mount(
                 Some("proc"),
@@ -370,11 +374,62 @@ fn run_in_rootfs(rootfs: &Path, cmd: &str) -> Result<()> {
                 None::<&str>,
             );
 
-            // Ensure DNS resolution works
+            // Mount /dev as tmpfs with device nodes
+            let _ = std::fs::create_dir_all("/dev");
+            let _ = nix::mount::mount(
+                Some("tmpfs"),
+                "/dev",
+                Some("tmpfs"),
+                nix::mount::MsFlags::empty(),
+                Some("mode=0755"),
+            );
+            // Bind-mount essential device nodes from host
+            for name in &["null", "zero", "random", "urandom", "tty"] {
+                let host_dev = format!("/dev/{}", name);
+                let target = format!("/dev/{}", name);
+                if std::path::Path::new(&host_dev).exists() {
+                    let _ = std::fs::write(&target, "");
+                    let _ = nix::mount::mount(
+                        Some(host_dev.as_str()),
+                        target.as_str(),
+                        None::<&str>,
+                        nix::mount::MsFlags::MS_BIND,
+                        None::<&str>,
+                    );
+                }
+            }
+            // /dev/fd, /dev/stdin, /dev/stdout, /dev/stderr
+            let _ = std::os::unix::fs::symlink("/proc/self/fd", "/dev/fd");
+            let _ = std::os::unix::fs::symlink("/proc/self/fd/0", "/dev/stdin");
+            let _ = std::os::unix::fs::symlink("/proc/self/fd/1", "/dev/stdout");
+            let _ = std::os::unix::fs::symlink("/proc/self/fd/2", "/dev/stderr");
+            // /dev/pts for PTY support
+            let _ = std::fs::create_dir_all("/dev/pts");
+            let _ = nix::mount::mount(
+                Some("devpts"),
+                "/dev/pts",
+                Some("devpts"),
+                nix::mount::MsFlags::empty(),
+                Some("newinstance,ptmxmode=0666"),
+            );
+            let _ = std::os::unix::fs::symlink("pts/ptmx", "/dev/ptmx");
+
+            // Mount /tmp as tmpfs
+            let _ = std::fs::create_dir_all("/tmp");
+            let _ = nix::mount::mount(
+                Some("tmpfs"),
+                "/tmp",
+                Some("tmpfs"),
+                nix::mount::MsFlags::empty(),
+                None::<&str>,
+            );
+
+            // Ensure DNS and hostname resolution work
             let _ = std::fs::create_dir_all("/etc");
             let _ = std::fs::write("/etc/resolv.conf", "nameserver 8.8.8.8\nnameserver 8.8.4.4\n");
+            let _ = std::fs::write("/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n");
 
-            // Disable apt privilege dropping (only uid 0 is mapped in our user namespace)
+            // Disable apt privilege dropping
             let _ = std::fs::create_dir_all("/etc/apt/apt.conf.d");
             let _ = std::fs::write(
                 "/etc/apt/apt.conf.d/01-coop-nosandbox",
