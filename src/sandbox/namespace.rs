@@ -78,15 +78,19 @@ pub fn create_session(
     std::fs::create_dir_all(&persist_path)?;
     std::fs::create_dir_all(&merge_path)?;
 
-    // Two pipes for parent-child synchronization:
+    // Three pipes for parent-child synchronization:
     // Pipe 1 (child→parent): child signals after unshare(), parent then writes UID/GID maps
     // Pipe 2 (parent→child): parent signals after writing maps, child then proceeds
+    // Pipe 3 (child→parent): child signals after fs setup complete (overlayfs+pivot_root done)
     let (pipe1_rd_owned, pipe1_wr_owned) = nix::unistd::pipe().context("Failed to create sync pipe 1")?;
     let pipe1_rd = pipe1_rd_owned.into_raw_fd(); // parent reads
     let pipe1_wr = pipe1_wr_owned.into_raw_fd(); // child writes
     let (pipe2_rd_owned, pipe2_wr_owned) = nix::unistd::pipe().context("Failed to create sync pipe 2")?;
     let pipe2_rd = pipe2_rd_owned.into_raw_fd(); // child reads
     let pipe2_wr = pipe2_wr_owned.into_raw_fd(); // parent writes
+    let (pipe3_rd_owned, pipe3_wr_owned) = nix::unistd::pipe().context("Failed to create sync pipe 3")?;
+    let pipe3_rd = pipe3_rd_owned.into_raw_fd(); // parent reads
+    let pipe3_wr = pipe3_wr_owned.into_raw_fd(); // child writes
 
     // Resolve the agent command before forking
     let agent_cmd = config
@@ -205,6 +209,7 @@ pub fn create_session(
             unsafe { nix::libc::close(slave_fd) };
             unsafe { nix::libc::close(pipe1_wr) };
             unsafe { nix::libc::close(pipe2_rd) };
+            unsafe { nix::libc::close(pipe3_wr) };
 
             // Wait for child to unshare() before writing UID/GID maps
             let mut buf = [0u8; 1];
@@ -220,6 +225,12 @@ pub fn create_session(
                 .context("Failed to signal child")?;
             drop(wr_fd);
 
+            // Wait for child to finish filesystem setup (overlayfs + pivot_root)
+            // so nsenter_shell can safely enter the namespace
+            let mut buf3 = [0u8; 1];
+            let _ = nix::unistd::read(pipe3_rd, &mut buf3);
+            unsafe { nix::libc::close(pipe3_rd) };
+
             Ok(SessionNamespace {
                 child_pid: child.as_raw() as u32,
                 pty_master_fd: master_fd,
@@ -231,6 +242,7 @@ pub fn create_session(
             unsafe { nix::libc::close(master_fd) };
             unsafe { nix::libc::close(pipe1_rd) };
             unsafe { nix::libc::close(pipe2_wr) };
+            unsafe { nix::libc::close(pipe3_rd) };
 
             // Unshare namespaces (this is the fork+unshare approach)
             if let Err(e) = nix::sched::unshare(ns_flags) {
@@ -285,6 +297,12 @@ pub fn create_session(
             ) {
                 eprintln!("coop: filesystem setup failed: {:?}", e);
                 std::process::exit(1);
+            }
+
+            // Signal parent that filesystem setup is complete — safe to nsenter now
+            {
+                let wr_fd = unsafe { OwnedFd::from_raw_fd(pipe3_wr) };
+                let _ = nix::unistd::write(&wr_fd, &[1u8]);
             }
 
             // Set hostname

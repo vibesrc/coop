@@ -32,10 +32,12 @@ pub struct PtyState {
     pub output_tx: Option<broadcast::Sender<Bytes>>,
     /// Shared scrollback buffer for replay on re-attach.
     pub scrollback: Option<Arc<Mutex<Vec<u8>>>>,
+    /// Whether this PTY auto-restarts on exit
+    pub auto_restart: bool,
 }
 
 impl PtyState {
-    fn new(id: u32, role: PtyRole, command: String, pid: u32, master_fd: RawFd) -> (Self, oneshot::Receiver<()>) {
+    fn new(id: u32, role: PtyRole, command: String, pid: u32, master_fd: RawFd, auto_restart: bool) -> (Self, oneshot::Receiver<()>) {
         let (output_tx, _) = broadcast::channel(256);
         let scrollback = Arc::new(Mutex::new(Vec::new()));
         let exit_rx = spawn_pty_reader(master_fd, output_tx.clone(), scrollback.clone());
@@ -47,6 +49,7 @@ impl PtyState {
             master_fd: Some(master_fd),
             output_tx: Some(output_tx),
             scrollback: Some(scrollback),
+            auto_restart,
         };
         (state, exit_rx)
     }
@@ -74,9 +77,7 @@ pub struct Session {
     pub user_env: Vec<(String, String)>,
     /// Workspace path inside the sandbox (e.g. /workspace)
     pub sandbox_workspace: String,
-    /// Auto-restart agent on exit
-    pub auto_restart: bool,
-    /// Delay before restarting agent (ms)
+    /// Delay before restarting PTYs with auto_restart (ms)
     pub restart_delay_ms: u64,
 }
 
@@ -246,7 +247,6 @@ impl SessionManager {
                     sandbox_user: "coop".to_string(),
                     user_env: vec![],
                     sandbox_workspace: "/workspace".to_string(),
-                    auto_restart: true,
                     restart_delay_ms: 1000,
                 },
             );
@@ -346,6 +346,7 @@ impl SessionManager {
             agent_cmd,
             ns_result.child_pid,
             ns_result.pty_master_fd,
+            auto_restart,
         );
         let output_tx = agent_pty.output_tx.clone().unwrap();
 
@@ -363,7 +364,6 @@ impl SessionManager {
             sandbox_user,
             user_env,
             sandbox_workspace,
-            auto_restart,
             restart_delay_ms,
         };
 
@@ -382,7 +382,6 @@ impl SessionManager {
             exit_rx,
             name.clone(),
             0,
-            PtyRole::Agent,
             ns_result.child_pid,
             output_tx,
             auto_restart,
@@ -426,9 +425,8 @@ impl SessionManager {
         _rows: u16,
     ) -> Result<Response> {
         let mut sessions = self.sessions.write().await;
-        let session = sessions.get_mut(session_name).ok_or_else(|| {
-            anyhow::anyhow!("Session '{}' not found", session_name)
-        })?;
+        let name = Self::resolve_name(&sessions, session_name)?;
+        let session = sessions.get_mut(&name).unwrap();
 
         let cmd = command.unwrap_or_else(|| session.default_shell.clone());
 
@@ -471,20 +469,19 @@ impl SessionManager {
             cmd,
             shell_ns.shell_pid,
             shell_ns.pty_master_fd,
+            false,
         );
         let output_tx = shell_pty.output_tx.clone().unwrap();
         session.ptys.push(shell_pty);
-        let session_name_owned = session_name.to_string();
         drop(sessions);
 
         self.spawn_exit_watcher(
             exit_rx,
-            session_name_owned,
+            name,
             pty_id,
-            PtyRole::Shell,
             shell_ns.shell_pid,
             output_tx,
-            false, // shells don't auto-restart
+            false,
             0,
         );
 
@@ -497,9 +494,8 @@ impl SessionManager {
     /// Kill a specific PTY session within a box
     pub async fn kill_pty(&self, session_name: &str, pty_id: u32) -> Result<Response> {
         let mut sessions = self.sessions.write().await;
-        let session = sessions.get_mut(session_name).ok_or_else(|| {
-            anyhow::anyhow!("Session '{}' not found", session_name)
-        })?;
+        let name = Self::resolve_name(&sessions, session_name)?;
+        let session = sessions.get_mut(&name).unwrap();
 
         let pty_idx = session
             .ptys
@@ -716,9 +712,8 @@ impl SessionManager {
         pty_id: u32,
     ) -> Result<Response> {
         let mut sessions = self.sessions.write().await;
-        let session = sessions.get_mut(session_name).ok_or_else(|| {
-            anyhow::anyhow!("Session '{}' not found", session_name)
-        })?;
+        let name = Self::resolve_name(&sessions, session_name)?;
+        let session = sessions.get_mut(&name).unwrap();
 
         let pty = session
             .ptys
@@ -727,15 +722,14 @@ impl SessionManager {
             .ok_or_else(|| anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name))?;
 
         let command = pty.command.clone();
-        let role = pty.role.clone();
         let old_pid = pty.pid;
         let old_master_fd = pty.master_fd;
+        let auto_restart = pty.auto_restart;
         let output_tx = pty.output_tx.clone()
             .ok_or_else(|| anyhow::anyhow!("PTY {} has no output channel", pty_id))?;
         let scrollback = pty.scrollback.clone()
             .ok_or_else(|| anyhow::anyhow!("PTY {} has no scrollback buffer", pty_id))?;
 
-        let auto_restart = session.auto_restart;
         let restart_delay_ms = session.restart_delay_ms;
 
         // nsenter new process FIRST (keeps namespace alive)
@@ -786,19 +780,16 @@ impl SessionManager {
             session.namespace_pid = shell_ns.shell_pid;
         }
 
-        let session_name_owned = session_name.to_string();
         drop(sessions);
 
-        // Spawn watcher for the new process
-        let watcher_auto_restart = matches!(role, PtyRole::Agent) && auto_restart;
+        // Spawn watcher for the new process (only auto-restart if the PTY had it before)
         self.spawn_exit_watcher(
             exit_rx,
-            session_name_owned,
+            name,
             pty_id,
-            role,
             shell_ns.shell_pid,
             output_tx,
-            watcher_auto_restart,
+            auto_restart,
             restart_delay_ms,
         );
 
@@ -882,14 +873,14 @@ impl SessionManager {
             .and_then(|p| p.pid)
     }
 
-    /// Spawn a background task that watches for a PTY reader to exit and takes
-    /// the appropriate action: auto-restart for agents, cleanup for shells.
+    /// Spawn a background task that watches for a PTY to exit.
+    /// If auto_restart is true, restarts the process after a delay.
+    /// Otherwise, cleans up the dead PTY.
     fn spawn_exit_watcher(
         self: &Arc<Self>,
         exit_rx: oneshot::Receiver<()>,
         session_name: String,
         pty_id: u32,
-        role: PtyRole,
         expected_pid: u32,
         output_tx: broadcast::Sender<Bytes>,
         auto_restart: bool,
@@ -897,56 +888,48 @@ impl SessionManager {
     ) {
         let sm = Arc::clone(self);
         tokio::spawn(async move {
-            // Wait for the PTY reader to exit
             let _ = exit_rx.await;
 
-            // Check if someone already restarted this PTY (e.g. manual `coop restart`)
+            // Check if someone already restarted this PTY
             if sm.get_pty_pid(&session_name, pty_id).await != Some(expected_pid) {
                 return;
             }
 
-            match role {
-                PtyRole::Agent if auto_restart => {
-                    // Notify connected clients via the broadcast channel
-                    let msg = format!(
-                        "\r\n\x1b[2m[agent exited, restarting in {}ms...]\x1b[0m\r\n",
-                        restart_delay_ms
-                    );
-                    let _ = output_tx.send(Bytes::from(msg));
+            if auto_restart {
+                let msg = format!(
+                    "\r\n\x1b[2m[process exited, restarting in {}ms...]\x1b[0m\r\n",
+                    restart_delay_ms
+                );
+                let _ = output_tx.send(Bytes::from(msg));
 
-                    tokio::time::sleep(std::time::Duration::from_millis(restart_delay_ms)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(restart_delay_ms)).await;
 
-                    // Check again after delay
-                    if sm.get_pty_pid(&session_name, pty_id).await != Some(expected_pid) {
-                        return;
-                    }
+                if sm.get_pty_pid(&session_name, pty_id).await != Some(expected_pid) {
+                    return;
+                }
 
-                    match sm.restart_pty(&session_name, pty_id).await {
-                        Ok(_) => tracing::info!(
-                            session = %session_name,
-                            pty = pty_id,
-                            "Auto-restarted agent"
-                        ),
-                        Err(e) => tracing::error!(
-                            session = %session_name,
-                            pty = pty_id,
-                            error = %e,
-                            "Failed to auto-restart agent"
-                        ),
-                    }
+                match sm.restart_pty(&session_name, pty_id).await {
+                    Ok(_) => tracing::info!(session = %session_name, pty = pty_id, "Auto-restarted PTY"),
+                    Err(e) => tracing::error!(session = %session_name, pty = pty_id, error = %e, "Failed to auto-restart PTY"),
                 }
-                PtyRole::Agent => {
-                    // auto_restart disabled — just notify
-                    let msg = "\r\n\x1b[2m[agent exited]\x1b[0m\r\n";
-                    let _ = output_tx.send(Bytes::from(msg));
-                }
-                PtyRole::Shell => {
-                    // Clean up the dead shell PTY
-                    tracing::info!(session = %session_name, pty = pty_id, "Shell exited, cleaning up");
-                    let _ = sm.kill_pty(&session_name, pty_id).await;
-                }
+            } else {
+                tracing::info!(session = %session_name, pty = pty_id, "PTY exited, cleaning up");
+                let _ = sm.kill_pty(&session_name, pty_id).await;
             }
         });
+    }
+
+    /// Resolve a session name or workspace path to the actual session key.
+    fn resolve_name(sessions: &HashMap<String, Session>, name_or_path: &str) -> Result<String> {
+        if sessions.contains_key(name_or_path) {
+            return Ok(name_or_path.to_string());
+        }
+        if name_or_path.contains('/') {
+            if let Some(s) = sessions.values().find(|s| s.workspace == name_or_path) {
+                return Ok(s.name.clone());
+            }
+        }
+        bail!("Session '{}' not found", name_or_path);
     }
 
     fn resolve_session<'a>(
@@ -954,18 +937,7 @@ impl SessionManager {
         sessions: &'a HashMap<String, Session>,
         name_or_path: &str,
     ) -> Result<&'a Session> {
-        // Direct name lookup
-        if let Some(s) = sessions.get(name_or_path) {
-            return Ok(s);
-        }
-
-        // Workspace path lookup
-        if name_or_path.contains('/') {
-            if let Some(s) = sessions.values().find(|s| s.workspace == name_or_path) {
-                return Ok(s);
-            }
-        }
-
-        bail!("Session '{}' not found", name_or_path);
+        let key = Self::resolve_name(sessions, name_or_path)?;
+        Ok(&sessions[&key])
     }
 }

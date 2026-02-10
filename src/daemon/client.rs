@@ -593,6 +593,7 @@ async fn run_stream_bridge(
                                         );
                                         stdout.write_all(msg.as_bytes()).await?;
                                         stdout.flush().await?;
+                                        break;
                                     }
                                     Ok(DaemonEvent::PtyRestarting { delay_ms }) => {
                                         let msg = format!(

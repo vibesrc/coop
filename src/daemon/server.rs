@@ -396,6 +396,8 @@ async fn handle_stream_mode_inner(
 
     // Subscribe BEFORE replaying scrollback so we don't miss anything
     let mut output_rx = output_tx.subscribe();
+    // Drop our sender clone so the channel properly closes when the PTY exits
+    drop(output_tx);
 
     // If we have a real master fd and not readonly, set initial window size
     if !target.readonly {
