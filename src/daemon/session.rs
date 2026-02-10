@@ -6,9 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
 use bytes::Bytes;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 
 use crate::config::{self, Coopfile, NetworkMode};
+use base64::Engine;
 use crate::ipc::{
     PtyInfo, PtyRole, Response, ResponseData, SessionInfo, ERR_SESSION_EXISTS,
     ERR_SESSION_NOT_FOUND,
@@ -33,6 +34,24 @@ pub struct PtyState {
     pub scrollback: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
+impl PtyState {
+    fn new(id: u32, role: PtyRole, command: String, pid: u32, master_fd: RawFd) -> (Self, oneshot::Receiver<()>) {
+        let (output_tx, _) = broadcast::channel(256);
+        let scrollback = Arc::new(Mutex::new(Vec::new()));
+        let exit_rx = spawn_pty_reader(master_fd, output_tx.clone(), scrollback.clone());
+        let state = Self {
+            id,
+            role,
+            command,
+            pid: Some(pid),
+            master_fd: Some(master_fd),
+            output_tx: Some(output_tx),
+            scrollback: Some(scrollback),
+        };
+        (state, exit_rx)
+    }
+}
+
 /// State of a running session
 #[derive(Debug)]
 pub struct Session {
@@ -55,9 +74,21 @@ pub struct Session {
     pub user_env: Vec<(String, String)>,
     /// Workspace path inside the sandbox (e.g. /workspace)
     pub sandbox_workspace: String,
+    /// Auto-restart agent on exit
+    pub auto_restart: bool,
+    /// Delay before restarting agent (ms)
+    pub restart_delay_ms: u64,
 }
 
 impl Session {
+    /// Remove dead PTY processes (both agent and shell roles).
+    fn prune_dead_ptys(&mut self) {
+        self.ptys.retain(|p| match p.pid {
+            Some(pid) => is_pid_alive(pid),
+            None => true,
+        });
+    }
+
     pub fn to_info(&self) -> SessionInfo {
         SessionInfo {
             name: self.name.clone(),
@@ -87,11 +118,14 @@ pub struct SessionManager {
 
 /// Spawn a persistent PTY reader task that reads from master_fd, broadcasts
 /// output to all subscribers, and appends to the scrollback buffer.
+/// Returns a oneshot receiver that fires when the reader exits (EOF).
 fn spawn_pty_reader(
     master_fd: RawFd,
     output_tx: broadcast::Sender<Bytes>,
     scrollback: Arc<Mutex<Vec<u8>>>,
-) {
+) -> oneshot::Receiver<()> {
+    let (exit_tx, exit_rx) = oneshot::channel();
+
     // Set non-blocking so AsyncFd works
     unsafe {
         let flags = nix::libc::fcntl(master_fd, nix::libc::F_GETFL);
@@ -104,6 +138,7 @@ fn spawn_pty_reader(
             Ok(f) => f,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to create AsyncFd for PTY master");
+                let _ = exit_tx.send(());
                 return;
             }
         };
@@ -151,7 +186,20 @@ fn spawn_pty_reader(
                 Err(_would_block) => continue,
             }
         }
+
+        let _ = exit_tx.send(());
     });
+
+    exit_rx
+}
+
+/// Check if a process is still alive via kill(pid, 0)
+fn is_pid_alive(pid: u32) -> bool {
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid as i32),
+        None,
+    )
+    .is_ok()
 }
 
 impl SessionManager {
@@ -198,13 +246,15 @@ impl SessionManager {
                     sandbox_user: "coop".to_string(),
                     user_env: vec![],
                     sandbox_workspace: "/workspace".to_string(),
+                    auto_restart: true,
+                    restart_delay_ms: 1000,
                 },
             );
         }
     }
 
     pub async fn create_session(
-        &self,
+        self: &Arc<Self>,
         name: Option<String>,
         workspace: String,
         _coopfile: Option<String>,
@@ -280,12 +330,6 @@ impl SessionManager {
             .unwrap_or_default()
             .as_secs();
 
-        let (output_tx, _) = broadcast::channel(256);
-        let scrollback = Arc::new(Mutex::new(Vec::new()));
-
-        let master_fd = ns_result.pty_master_fd;
-        spawn_pty_reader(master_fd, output_tx.clone(), scrollback.clone());
-
         let sandbox_user = config.sandbox.user.clone();
         let sandbox_home = format!("/home/{}", sandbox_user);
         let network_isolated = config.network.mode != NetworkMode::Host;
@@ -293,20 +337,24 @@ impl SessionManager {
         let sandbox_workspace = config.workspace.path.clone();
         let user_env: Vec<(String, String)> = config.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
+        let auto_restart = config.session.auto_restart;
+        let restart_delay_ms = config.session.restart_delay_ms;
+
+        let (agent_pty, exit_rx) = PtyState::new(
+            0,
+            PtyRole::Agent,
+            agent_cmd,
+            ns_result.child_pid,
+            ns_result.pty_master_fd,
+        );
+        let output_tx = agent_pty.output_tx.clone().unwrap();
+
         let session = Session {
             name: name.clone(),
             workspace: workspace.clone(),
             namespace_pid: ns_result.child_pid,
             created: now,
-            ptys: vec![PtyState {
-                id: 0,
-                role: PtyRole::Agent,
-                command: agent_cmd,
-                pid: Some(ns_result.child_pid),
-                master_fd: Some(master_fd),
-                output_tx: Some(output_tx),
-                scrollback: Some(scrollback),
-            }],
+            ptys: vec![agent_pty],
             local_clients: 0,
             web_clients: 0,
             default_shell,
@@ -315,6 +363,8 @@ impl SessionManager {
             sandbox_user,
             user_env,
             sandbox_workspace,
+            auto_restart,
+            restart_delay_ms,
         };
 
         tracing::info!(
@@ -326,6 +376,18 @@ impl SessionManager {
 
         let mut sessions = self.sessions.write().await;
         sessions.insert(name.clone(), session);
+        drop(sessions);
+
+        self.spawn_exit_watcher(
+            exit_rx,
+            name.clone(),
+            0,
+            PtyRole::Agent,
+            ns_result.child_pid,
+            output_tx,
+            auto_restart,
+            restart_delay_ms,
+        );
 
         Ok(Response::ok_with(ResponseData {
             session: Some(name),
@@ -356,9 +418,10 @@ impl SessionManager {
     }
 
     pub async fn spawn_shell(
-        &self,
+        self: &Arc<Self>,
         session_name: &str,
         command: Option<String>,
+        force_new: bool,
         _cols: u16,
         _rows: u16,
     ) -> Result<Response> {
@@ -368,7 +431,22 @@ impl SessionManager {
         })?;
 
         let cmd = command.unwrap_or_else(|| session.default_shell.clone());
-        let pty_id = session.ptys.len() as u32;
+
+        session.prune_dead_ptys();
+
+        // Unless forced, try to find an existing live shell running the same command
+        if !force_new {
+            if let Some(existing) = session.ptys.iter().find(|p| {
+                p.role == PtyRole::Shell && p.command == cmd
+            }) {
+                return Ok(Response::ok_with(ResponseData {
+                    pty: Some(existing.id),
+                    ..Default::default()
+                }));
+            }
+        }
+
+        let pty_id = session.ptys.iter().map(|p| p.id).max().map_or(1, |m| m + 1);
 
         let env_vars = session.user_env.clone();
         let ns_pid = session.namespace_pid;
@@ -387,20 +465,28 @@ impl SessionManager {
             &sandbox_workspace,
         )?;
 
-        let (output_tx, _) = broadcast::channel(256);
-        let scrollback = Arc::new(Mutex::new(Vec::new()));
+        let (shell_pty, exit_rx) = PtyState::new(
+            pty_id,
+            PtyRole::Shell,
+            cmd,
+            shell_ns.shell_pid,
+            shell_ns.pty_master_fd,
+        );
+        let output_tx = shell_pty.output_tx.clone().unwrap();
+        session.ptys.push(shell_pty);
+        let session_name_owned = session_name.to_string();
+        drop(sessions);
 
-        spawn_pty_reader(shell_ns.pty_master_fd, output_tx.clone(), scrollback.clone());
-
-        session.ptys.push(PtyState {
-            id: pty_id,
-            role: PtyRole::Shell,
-            command: cmd,
-            pid: Some(shell_ns.shell_pid),
-            master_fd: Some(shell_ns.pty_master_fd),
-            output_tx: Some(output_tx),
-            scrollback: Some(scrollback),
-        });
+        self.spawn_exit_watcher(
+            exit_rx,
+            session_name_owned,
+            pty_id,
+            PtyRole::Shell,
+            shell_ns.shell_pid,
+            output_tx,
+            false, // shells don't auto-restart
+            0,
+        );
 
         Ok(Response::ok_with(ResponseData {
             pty: Some(pty_id),
@@ -445,6 +531,13 @@ impl SessionManager {
 
     /// List PTY sessions within a specific box
     pub async fn session_ls(&self, session_name: &str) -> Result<Response> {
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(session) = sessions.get_mut(session_name) {
+                session.prune_dead_ptys();
+            }
+        }
+
         let sessions = self.sessions.read().await;
         let session = self.resolve_session(&sessions, session_name)?;
         let ptys: Vec<crate::ipc::PtyInfo> = session
@@ -564,6 +657,166 @@ impl SessionManager {
         Ok(Response::ok())
     }
 
+    /// Get scrollback logs for a PTY, optionally tail N lines.
+    pub async fn get_logs(
+        &self,
+        session_name: &str,
+        pty_id: u32,
+        tail_lines: Option<usize>,
+    ) -> Result<Response> {
+        let sessions = self.sessions.read().await;
+        let session = self.resolve_session(&sessions, session_name)?;
+
+        let pty = session
+            .ptys
+            .iter()
+            .find(|p| p.id == pty_id)
+            .ok_or_else(|| anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name))?;
+
+        let scrollback = pty
+            .scrollback
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("PTY {} has no scrollback buffer", pty_id))?;
+
+        let data = scrollback.lock().await;
+        let bytes = if let Some(n) = tail_lines {
+            if n == 0 {
+                data.clone()
+            } else {
+                // Scan backwards for N newlines
+                let mut count = 0;
+                let mut start = data.len();
+                for i in (0..data.len()).rev() {
+                    if data[i] == b'\n' {
+                        count += 1;
+                        if count >= n {
+                            start = i + 1;
+                            break;
+                        }
+                    }
+                }
+                data[start..].to_vec()
+            }
+        } else {
+            data.clone()
+        };
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(Response::ok_with(ResponseData {
+            log_data: Some(encoded),
+            ..Default::default()
+        }))
+    }
+
+    /// Restart a PTY process (agent or shell). Reuses the same broadcast
+    /// channel and scrollback so connected clients stay connected.
+    pub async fn restart_pty(
+        self: &Arc<Self>,
+        session_name: &str,
+        pty_id: u32,
+    ) -> Result<Response> {
+        let mut sessions = self.sessions.write().await;
+        let session = sessions.get_mut(session_name).ok_or_else(|| {
+            anyhow::anyhow!("Session '{}' not found", session_name)
+        })?;
+
+        let pty = session
+            .ptys
+            .iter()
+            .find(|p| p.id == pty_id)
+            .ok_or_else(|| anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name))?;
+
+        let command = pty.command.clone();
+        let role = pty.role.clone();
+        let old_pid = pty.pid;
+        let old_master_fd = pty.master_fd;
+        let output_tx = pty.output_tx.clone()
+            .ok_or_else(|| anyhow::anyhow!("PTY {} has no output channel", pty_id))?;
+        let scrollback = pty.scrollback.clone()
+            .ok_or_else(|| anyhow::anyhow!("PTY {} has no scrollback buffer", pty_id))?;
+
+        let auto_restart = session.auto_restart;
+        let restart_delay_ms = session.restart_delay_ms;
+
+        // nsenter new process FIRST (keeps namespace alive)
+        let env_vars = session.user_env.clone();
+        let ns_pid = session.namespace_pid;
+        let network_isolated = session.network_isolated;
+        let sandbox_user = session.sandbox_user.clone();
+        let sandbox_home = session.sandbox_home.clone();
+        let sandbox_workspace = session.sandbox_workspace.clone();
+
+        let shell_ns = namespace::nsenter_shell(
+            ns_pid,
+            &command,
+            &env_vars,
+            network_isolated,
+            &sandbox_user,
+            &sandbox_home,
+            &sandbox_workspace,
+        )?;
+
+        // Kill old process
+        if let Some(pid) = old_pid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+
+        // Close old master fd
+        if let Some(fd) = old_master_fd {
+            unsafe { nix::libc::close(fd) };
+        }
+
+        // Start new pty_reader with SAME output_tx and scrollback
+        let exit_rx = spawn_pty_reader(shell_ns.pty_master_fd, output_tx.clone(), scrollback);
+
+        // Update PtyState in-place
+        let pty = session
+            .ptys
+            .iter_mut()
+            .find(|p| p.id == pty_id)
+            .unwrap();
+        pty.pid = Some(shell_ns.shell_pid);
+        pty.master_fd = Some(shell_ns.pty_master_fd);
+
+        // If this was the agent (PTY 0), update namespace_pid
+        if pty_id == 0 {
+            session.namespace_pid = shell_ns.shell_pid;
+        }
+
+        let session_name_owned = session_name.to_string();
+        drop(sessions);
+
+        // Spawn watcher for the new process
+        let watcher_auto_restart = matches!(role, PtyRole::Agent) && auto_restart;
+        self.spawn_exit_watcher(
+            exit_rx,
+            session_name_owned,
+            pty_id,
+            role,
+            shell_ns.shell_pid,
+            output_tx,
+            watcher_auto_restart,
+            restart_delay_ms,
+        );
+
+        tracing::info!(
+            session = %session_name,
+            pty = pty_id,
+            old_pid = ?old_pid,
+            new_pid = shell_ns.shell_pid,
+            "Restarted PTY"
+        );
+
+        Ok(Response::ok_with(ResponseData {
+            pid: Some(shell_ns.shell_pid),
+            pty: Some(pty_id),
+            ..Default::default()
+        }))
+    }
+
     /// Get the broadcast sender and master fd for a PTY in a session.
     /// Used by stream mode to bridge client connections to the PTY.
     pub async fn get_pty_handle(
@@ -618,6 +871,82 @@ impl SessionManager {
         if let Some(s) = sessions.get_mut(session_name) {
             s.web_clients = s.web_clients.saturating_sub(1);
         }
+    }
+
+    /// Get the current PID of a PTY (used by watcher to detect stale restarts).
+    async fn get_pty_pid(&self, session_name: &str, pty_id: u32) -> Option<u32> {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(session_name)
+            .and_then(|s| s.ptys.iter().find(|p| p.id == pty_id))
+            .and_then(|p| p.pid)
+    }
+
+    /// Spawn a background task that watches for a PTY reader to exit and takes
+    /// the appropriate action: auto-restart for agents, cleanup for shells.
+    fn spawn_exit_watcher(
+        self: &Arc<Self>,
+        exit_rx: oneshot::Receiver<()>,
+        session_name: String,
+        pty_id: u32,
+        role: PtyRole,
+        expected_pid: u32,
+        output_tx: broadcast::Sender<Bytes>,
+        auto_restart: bool,
+        restart_delay_ms: u64,
+    ) {
+        let sm = Arc::clone(self);
+        tokio::spawn(async move {
+            // Wait for the PTY reader to exit
+            let _ = exit_rx.await;
+
+            // Check if someone already restarted this PTY (e.g. manual `coop restart`)
+            if sm.get_pty_pid(&session_name, pty_id).await != Some(expected_pid) {
+                return;
+            }
+
+            match role {
+                PtyRole::Agent if auto_restart => {
+                    // Notify connected clients via the broadcast channel
+                    let msg = format!(
+                        "\r\n\x1b[2m[agent exited, restarting in {}ms...]\x1b[0m\r\n",
+                        restart_delay_ms
+                    );
+                    let _ = output_tx.send(Bytes::from(msg));
+
+                    tokio::time::sleep(std::time::Duration::from_millis(restart_delay_ms)).await;
+
+                    // Check again after delay
+                    if sm.get_pty_pid(&session_name, pty_id).await != Some(expected_pid) {
+                        return;
+                    }
+
+                    match sm.restart_pty(&session_name, pty_id).await {
+                        Ok(_) => tracing::info!(
+                            session = %session_name,
+                            pty = pty_id,
+                            "Auto-restarted agent"
+                        ),
+                        Err(e) => tracing::error!(
+                            session = %session_name,
+                            pty = pty_id,
+                            error = %e,
+                            "Failed to auto-restart agent"
+                        ),
+                    }
+                }
+                PtyRole::Agent => {
+                    // auto_restart disabled — just notify
+                    let msg = "\r\n\x1b[2m[agent exited]\x1b[0m\r\n";
+                    let _ = output_tx.send(Bytes::from(msg));
+                }
+                PtyRole::Shell => {
+                    // Clean up the dead shell PTY
+                    tracing::info!(session = %session_name, pty = pty_id, "Shell exited, cleaning up");
+                    let _ = sm.kill_pty(&session_name, pty_id).await;
+                }
+            }
+        });
     }
 
     fn resolve_session<'a>(

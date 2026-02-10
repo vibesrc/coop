@@ -63,12 +63,11 @@ pub struct SandboxConfig {
     pub setup: Vec<String>,
     #[serde(default = "default_user")]
     pub user: String,
-    /// Direct bind mounts (host path mounted read-write into sandbox)
+    /// Mounts into the sandbox. Path-based entries (e.g. "~/.bashrc:~/.bashrc")
+    /// are bind-mounted directly. Named entries (e.g. "claude-config:~/.claude")
+    /// use managed persistent storage (see `coop volume ls/rm/prune`).
     #[serde(default)]
     pub mounts: Vec<MountConfig>,
-    /// Volume mounts (copied from host on first use, persisted per-session)
-    #[serde(default)]
-    pub volumes: Vec<MountConfig>,
 }
 
 impl SandboxConfig {
@@ -94,7 +93,6 @@ impl Default for SandboxConfig {
             setup: Vec::new(),
             user: default_user(),
             mounts: Vec::new(),
-            volumes: Vec::new(),
         }
     }
 }
@@ -309,9 +307,6 @@ impl Coopfile {
         }
         if !other.sandbox.mounts.is_empty() {
             self.sandbox.mounts.extend(other.sandbox.mounts.iter().cloned());
-        }
-        if !other.sandbox.volumes.is_empty() {
-            self.sandbox.volumes.extend(other.sandbox.volumes.iter().cloned());
         }
 
         // Env: additive merge

@@ -64,7 +64,7 @@ pub async fn ensure_rootfs(force_build: bool, no_cache: bool) -> Result<()> {
         println!("First run — building rootfs...");
         do_build_rootfs(&config).await?;
     } else if rootfs_is_stale(&config)? {
-        eprintln!("Warning: coop.toml has changed since last build. Run `coop rebuild` to update.");
+        eprintln!("Warning: coop.toml has changed since last build. Run `coop build` to update.");
     }
 
     Ok(())
@@ -81,7 +81,7 @@ pub async fn build_rootfs(_coopfile_path: &str, no_cache: bool) -> Result<()> {
 
     if base_path.exists() && !no_cache && !rootfs_is_stale(&config)? {
         println!("Rootfs already built at {}", base_path.display());
-        println!("Use `coop rebuild` to force rebuild");
+        println!("Use `coop build --no-cache` to force rebuild");
         return Ok(());
     }
 

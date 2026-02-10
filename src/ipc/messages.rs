@@ -50,6 +50,8 @@ pub enum Command {
         session: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         command: Option<String>,
+        #[serde(default)]
+        force_new: bool,
         #[serde(default = "default_cols")]
         cols: u16,
         #[serde(default = "default_rows")]
@@ -84,6 +86,20 @@ pub enum Command {
     },
     /// Kill a specific PTY session within a box
     SessionKill {
+        session: String,
+        pty: u32,
+    },
+    /// View PTY scrollback logs
+    Logs {
+        session: String,
+        pty: u32,
+        #[serde(default)]
+        follow: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tail_lines: Option<usize>,
+    },
+    /// Restart a PTY process (agent or shell)
+    Restart {
         session: String,
         pty: u32,
     },
@@ -141,6 +157,8 @@ pub struct ResponseData {
     pub short_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qr_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_data: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

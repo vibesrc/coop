@@ -122,6 +122,8 @@ struct StreamTarget {
     pty: u32,
     cols: u16,
     rows: u16,
+    /// When true, client is read-only (no stdin writes, no resize)
+    readonly: bool,
 }
 
 async fn handle_client(
@@ -201,6 +203,7 @@ async fn handle_client(
                 pty: *pty,
                 cols: *cols,
                 rows: *rows,
+                readonly: false,
             }),
             Command::Shell {
                 session,
@@ -212,6 +215,19 @@ async fn handle_client(
                 pty: 0, // will be filled from response
                 cols: *cols,
                 rows: *rows,
+                readonly: false,
+            }),
+            Command::Logs {
+                session,
+                pty,
+                follow,
+                ..
+            } if *follow => Some(StreamTarget {
+                session: session.clone(),
+                pty: *pty,
+                cols: 0,
+                rows: 0,
+                readonly: true,
             }),
             _ => None,
         };
@@ -238,11 +254,12 @@ async fn handle_client(
             Command::Shell {
                 session,
                 command,
+                force_new,
                 cols,
                 rows,
             } => {
                 session_manager
-                    .spawn_shell(&session, command, cols, rows)
+                    .spawn_shell(&session, command, force_new, cols, rows)
                     .await
             }
             Command::Ls => session_manager.list_sessions().await,
@@ -286,6 +303,12 @@ async fn handle_client(
             }
             Command::SessionKill { session, pty } => {
                 session_manager.kill_pty(&session, pty).await
+            }
+            Command::Logs { session, pty, tail_lines, .. } => {
+                session_manager.get_logs(&session, pty, tail_lines).await
+            }
+            Command::Restart { session, pty } => {
+                session_manager.restart_pty(&session, pty).await
             }
             Command::Shutdown => {
                 let _ = shutdown_tx.send(());
@@ -374,9 +397,11 @@ async fn handle_stream_mode_inner(
     // Subscribe BEFORE replaying scrollback so we don't miss anything
     let mut output_rx = output_tx.subscribe();
 
-    // If we have a real master fd, set initial window size and trigger redraw
-    if let Some(fd) = master_fd {
-        set_pty_size(fd, target.cols, target.rows);
+    // If we have a real master fd and not readonly, set initial window size
+    if !target.readonly {
+        if let Some(fd) = master_fd {
+            set_pty_size(fd, target.cols, target.rows);
+        }
     }
 
     // Replay scrollback buffer so the client sees previous terminal state
@@ -399,23 +424,27 @@ async fn handle_stream_mode_inner(
                     Some(Ok(frame)) => {
                         match frame.frame_type {
                             FRAME_PTY_DATA => {
-                                // Write input to PTY master
-                                if let Some(fd) = master_fd {
-                                    let data = &frame.payload;
-                                    unsafe {
-                                        nix::libc::write(
-                                            fd,
-                                            data.as_ptr() as *const _,
-                                            data.len(),
-                                        );
+                                // Write input to PTY master (skip if readonly)
+                                if !target.readonly {
+                                    if let Some(fd) = master_fd {
+                                        let data = &frame.payload;
+                                        unsafe {
+                                            nix::libc::write(
+                                                fd,
+                                                data.as_ptr() as *const _,
+                                                data.len(),
+                                            );
+                                        }
                                     }
                                 }
                             }
                             FRAME_CONTROL => {
                                 match serde_json::from_slice::<Command>(&frame.payload) {
                                     Ok(Command::Resize { cols, rows }) => {
-                                        if let Some(fd) = master_fd {
-                                            set_pty_size(fd, cols, rows);
+                                        if !target.readonly {
+                                            if let Some(fd) = master_fd {
+                                                set_pty_size(fd, cols, rows);
+                                            }
                                         }
                                     }
                                     Ok(Command::Detach) => {

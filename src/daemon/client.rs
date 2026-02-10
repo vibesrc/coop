@@ -5,6 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 
+use base64::Engine;
 use crate::ipc::{
     Command, DaemonEvent, MessageCodec, Response, StreamCodec, StreamFrame, VersionHandshake,
     VersionResponse, FRAME_CONTROL, FRAME_PTY_DATA, PROTOCOL_VERSION,
@@ -156,6 +157,7 @@ impl DaemonClient {
         name: Option<&str>,
         workspace: &str,
         command: Option<&str>,
+        force_new: bool,
     ) -> Result<()> {
         // Try create (ignored if already exists)
         let cmd = Command::Create {
@@ -195,14 +197,15 @@ impl DaemonClient {
             );
         };
 
-        self.shell(&session_name, command).await
+        self.shell(&session_name, command, force_new).await
     }
 
-    pub async fn shell(mut self, session: &str, command: Option<&str>) -> Result<()> {
+    pub async fn shell(mut self, session: &str, command: Option<&str>, force_new: bool) -> Result<()> {
         let (cols, rows) = terminal_size();
         let cmd = Command::Shell {
             session: session.to_string(),
             command: command.map(|s| s.to_string()),
+            force_new,
             cols,
             rows,
         };
@@ -425,6 +428,56 @@ impl DaemonClient {
     pub async fn stop_serve(mut self) -> Result<()> {
         // TODO: implement serve stop
         bail!("Serve stop not yet implemented");
+    }
+
+    pub async fn logs(
+        mut self,
+        session: &str,
+        pty: u32,
+        follow: bool,
+        tail_lines: Option<usize>,
+    ) -> Result<()> {
+        let cmd = Command::Logs {
+            session: session.to_string(),
+            pty,
+            follow,
+            tail_lines,
+        };
+        let resp = self.send_command(&cmd).await?;
+        if !resp.ok {
+            bail!("Failed to get logs: {}", resp.message.unwrap_or_default());
+        }
+
+        // Decode and print initial scrollback
+        if let Some(log_data) = &resp.data.log_data {
+            let bytes = base64::engine::general_purpose::STANDARD.decode(log_data)?;
+            if !bytes.is_empty() {
+                let mut stdout = tokio::io::stdout();
+                stdout.write_all(&bytes).await?;
+                stdout.flush().await?;
+            }
+        }
+
+        if follow {
+            // Enter stream mode to follow live output
+            self.enter_stream_mode(session, pty).await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn restart(mut self, session: &str, pty: u32) -> Result<()> {
+        let cmd = Command::Restart {
+            session: session.to_string(),
+            pty,
+        };
+        let resp = self.send_command(&cmd).await?;
+        if !resp.ok {
+            bail!("Failed to restart: {}", resp.message.unwrap_or_default());
+        }
+        let new_pid = resp.data.pid.map(|p| p.to_string()).unwrap_or_default();
+        println!("PTY {} restarted (pid {})", pty, new_pid);
+        Ok(())
     }
 
     /// Enter stream mode for an attached PTY session.

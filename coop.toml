@@ -8,8 +8,8 @@ setup = [
   "DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y bash curl git ca-certificates",
 ]
 
-volumes = [
+mounts = [
   "~/.bashrc:~/.bashrc",       # for bash configuration
-  "~/.local/bin:~/.local/bin", # use local claude binary if available
+  "~/.local/claude:~/.local/claude", # use local claude binary
   "claude-config:~/.claude",   # for claude configuration
 ]

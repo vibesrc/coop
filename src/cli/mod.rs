@@ -52,14 +52,18 @@ pub enum Commands {
         name: Option<String>,
     },
 
-    /// Spawn a new shell PTY inside a box
+    /// Open or manage shell sessions inside a box
     Shell {
-        /// Box name
-        name: Option<String>,
+        #[command(subcommand)]
+        action: Option<ShellAction>,
 
         /// Shell command (default: from config shell_command, or /bin/bash)
         #[arg(short, long)]
         command: Option<String>,
+
+        /// Force create a new shell (don't reattach to existing)
+        #[arg(long)]
+        new: bool,
     },
 
     /// List all running boxes
@@ -83,19 +87,15 @@ pub enum Commands {
         force: bool,
     },
 
-    /// Build the rootfs from the Coopfile
-    Init {
-        /// Coopfile path
-        #[arg(short, long, default_value = "./coop.toml")]
-        file: String,
+    /// Initialize a new coop.toml in the current directory
+    Init,
 
-        /// Ignore cached OCI layers
+    /// Build (or rebuild) the rootfs from the Coopfile
+    Build {
+        /// Ignore cached OCI layers and rootfs
         #[arg(long)]
         no_cache: bool,
     },
-
-    /// Rebuild the rootfs
-    Rebuild,
 
     /// Show status
     Status,
@@ -146,31 +146,25 @@ pub enum Commands {
         action: SessionAction,
     },
 
-    /// Manage named volumes
-    Volume {
+    /// Manage the coop system (daemon, volumes, images, cache)
+    System {
         #[command(subcommand)]
-        action: VolumeAction,
+        action: SystemAction,
     },
 
-    /// Manage rootfs images and cache
-    Image {
-        #[command(subcommand)]
-        action: ImageAction,
-    },
-
-    /// Gracefully shut down the daemon
-    Shutdown,
-
-    /// Tail the daemon log
+    /// View agent (PTY 0) scrollback logs
     Logs {
-        /// Follow log output
+        /// Follow output live
         #[arg(short, long)]
         follow: bool,
 
-        /// Number of lines
-        #[arg(short, default_value_t = 50)]
+        /// Show last N lines (0 = all)
+        #[arg(short, default_value_t = 0)]
         n: usize,
     },
+
+    /// Restart the agent process (PTY 0)
+    Restart,
 }
 
 #[derive(Subcommand, Debug)]
@@ -186,13 +180,16 @@ pub enum BoxAction {
         /// Box name
         name: Option<String>,
     },
-    /// Spawn a new shell PTY inside a box
+    /// Open a shell in a box
     Shell {
         /// Box name
         name: Option<String>,
         /// Shell command (default: from config shell_command, or /bin/bash)
         #[arg(short, long)]
         command: Option<String>,
+        /// Force create a new shell (don't reattach to existing)
+        #[arg(long)]
+        new: bool,
     },
     /// Kill a box
     Kill {
@@ -204,6 +201,38 @@ pub enum BoxAction {
         /// Force kill (SIGKILL, no grace period)
         #[arg(short)]
         force: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ShellAction {
+    /// List shell sessions in the current box
+    Ls,
+    /// Attach to an existing shell session by ID
+    Attach {
+        /// PTY session ID
+        id: u32,
+    },
+    /// Kill a shell session
+    Kill {
+        /// PTY session ID
+        id: u32,
+    },
+    /// View shell PTY scrollback logs
+    Logs {
+        /// PTY session ID
+        id: u32,
+        /// Follow output live
+        #[arg(short, long)]
+        follow: bool,
+        /// Show last N lines (0 = all)
+        #[arg(short, default_value_t = 0)]
+        n: usize,
+    },
+    /// Restart a shell process
+    Restart {
+        /// PTY session ID (default: first shell)
+        id: Option<u32>,
     },
 }
 
@@ -224,28 +253,41 @@ pub enum SessionAction {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum VolumeAction {
+pub enum SystemAction {
+    /// Show daemon and system status
+    Status,
+    /// Tail the daemon log
+    Logs {
+        /// Follow log output
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of lines
+        #[arg(short, default_value_t = 50)]
+        n: usize,
+    },
+    /// Gracefully shut down the daemon
+    Shutdown,
     /// List named volumes
-    Ls,
+    Volumes,
     /// Remove a named volume
-    Rm {
+    #[command(name = "volume-rm")]
+    VolumeRm {
         /// Volume name
         name: String,
     },
-    /// Remove all named volumes
-    Prune,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ImageAction {
-    /// Show rootfs and cache info
-    Info,
-    /// Remove the built rootfs (add --all to also remove OCI layer cache)
-    Rm {
+    /// Remove all unused volumes
+    #[command(name = "volume-prune")]
+    VolumePrune,
+    /// Show rootfs and cache disk usage
+    Df,
+    /// Remove rootfs and/or OCI cache
+    Clean {
         /// Also remove OCI layer cache
         #[arg(long)]
         all: bool,
     },
+    /// Remove everything (rootfs, cache, volumes, sessions)
+    Prune,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
@@ -280,24 +322,44 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         Some(Commands::Attach { name }) => cmd_attach(name).await?,
-        Some(Commands::Shell { name, command }) => cmd_shell(name, command.as_deref()).await?,
+        Some(Commands::Shell { action, command, new }) => {
+            match action {
+                None => cmd_shell(None, command.as_deref(), new).await?,
+                Some(ShellAction::Ls) => cmd_shell_ls().await?,
+                Some(ShellAction::Attach { id }) => cmd_shell_attach(id).await?,
+                Some(ShellAction::Kill { id }) => cmd_shell_kill(id).await?,
+                Some(ShellAction::Logs { id, follow, n }) => {
+                    let box_name = default_box_name();
+                    let tail = if n > 0 { Some(n) } else { None };
+                    let client = crate::daemon::client::DaemonClient::connect().await?;
+                    client.logs(&box_name, id, follow, tail).await?;
+                }
+                Some(ShellAction::Restart { id }) => {
+                    let box_name = default_box_name();
+                    let pty_id = id.unwrap_or(1); // Default to first shell (PTY 1)
+                    let client = crate::daemon::client::DaemonClient::connect().await?;
+                    client.restart(&box_name, pty_id).await?;
+                }
+            }
+        }
         Some(Commands::Ls { json }) => cmd_ls(json).await?,
         Some(Commands::Kill { name, all, force }) => cmd_kill(name, all, force).await?,
         Some(Commands::Box { action }) => {
             match action {
                 BoxAction::Ls { json } => cmd_ls(json).await?,
                 BoxAction::Attach { name } => cmd_attach(name).await?,
-                BoxAction::Shell { name, command } => cmd_shell(name, command.as_deref()).await?,
+                BoxAction::Shell { name, command, new } => cmd_shell(name, command.as_deref(), new).await?,
                 BoxAction::Kill { name, all, force } => cmd_kill(name, all, force).await?,
             }
         }
-        Some(Commands::Init { file, no_cache }) => {
-            crate::sandbox::init::build_rootfs(&file, no_cache).await?;
+        Some(Commands::Init) => {
+            cmd_init().await?;
         }
-        Some(Commands::Rebuild) => {
-            crate::sandbox::init::build_rootfs("./coop.toml", true).await?;
+        Some(Commands::Build { no_cache }) => {
+            crate::sandbox::init::build_rootfs("./coop.toml", no_cache).await?;
         }
         Some(Commands::Status) => {
+            // Keep as a convenience alias for `coop system status`
             let client = crate::daemon::client::DaemonClient::connect().await?;
             client.status().await?;
         }
@@ -338,103 +400,19 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Some(Commands::Volume { action }) => {
-            let volumes_dir = crate::config::coop_dir()?.join("volumes");
-            match action {
-                VolumeAction::Ls => {
-                    if !volumes_dir.exists() {
-                        println!("No volumes.");
-                        return Ok(());
-                    }
-                    let mut found = false;
-                    for entry in std::fs::read_dir(&volumes_dir)? {
-                        let entry = entry?;
-                        if entry.file_type()?.is_dir() {
-                            let name = entry.file_name();
-                            let size = dir_size(&entry.path());
-                            println!("{:<30} {}", name.to_string_lossy(), format_size(size));
-                            found = true;
-                        }
-                    }
-                    if !found {
-                        println!("No volumes.");
-                    }
-                }
-                VolumeAction::Rm { name } => {
-                    let vol_path = volumes_dir.join(&name);
-                    if vol_path.exists() {
-                        std::fs::remove_dir_all(&vol_path)?;
-                        println!("Removed volume: {}", name);
-                    } else {
-                        anyhow::bail!("Volume '{}' not found", name);
-                    }
-                }
-                VolumeAction::Prune => {
-                    if volumes_dir.exists() {
-                        let mut count = 0;
-                        for entry in std::fs::read_dir(&volumes_dir)? {
-                            let entry = entry?;
-                            if entry.file_type()?.is_dir() {
-                                std::fs::remove_dir_all(entry.path())?;
-                                count += 1;
-                            }
-                        }
-                        println!("Removed {} volume(s).", count);
-                    } else {
-                        println!("No volumes to prune.");
-                    }
-                }
-            }
-        }
-        Some(Commands::Image { action }) => {
-            let rootfs_path = crate::config::rootfs_base_path()?;
-            let oci_path = crate::config::oci_cache_dir()?;
-            match action {
-                ImageAction::Info => {
-                    if rootfs_path.exists() {
-                        let size = dir_size(&rootfs_path);
-                        println!("Rootfs:     {} ({})", rootfs_path.display(), format_size(size));
-                        // Show manifest hash
-                        let manifest = crate::config::coop_dir()?.join("rootfs").join("manifest");
-                        if let Ok(hash) = std::fs::read_to_string(&manifest) {
-                            println!("Config hash: {}", hash.trim());
-                        }
-                    } else {
-                        println!("Rootfs:     not built");
-                    }
-                    if oci_path.exists() {
-                        let size = dir_size(&oci_path);
-                        println!("OCI cache:  {} ({})", oci_path.display(), format_size(size));
-                    } else {
-                        println!("OCI cache:  empty");
-                    }
-                }
-                ImageAction::Rm { all } => {
-                    let mut removed = false;
-                    if rootfs_path.exists() {
-                        std::fs::remove_dir_all(&rootfs_path)?;
-                        let manifest = crate::config::coop_dir()?.join("rootfs").join("manifest");
-                        let _ = std::fs::remove_file(&manifest);
-                        println!("Removed rootfs.");
-                        removed = true;
-                    }
-                    if all && oci_path.exists() {
-                        std::fs::remove_dir_all(&oci_path)?;
-                        println!("Removed OCI cache.");
-                        removed = true;
-                    }
-                    if !removed {
-                        println!("Nothing to remove.");
-                    }
-                }
-            }
-        }
-        Some(Commands::Shutdown) => {
-            let client = crate::daemon::client::DaemonClient::connect().await?;
-            client.shutdown().await?;
+        Some(Commands::System { action }) => {
+            cmd_system(action).await?;
         }
         Some(Commands::Logs { follow, n }) => {
-            crate::daemon::logs::tail_logs(follow, n).await?;
+            let box_name = default_box_name();
+            let tail = if n > 0 { Some(n) } else { None };
+            let client = crate::daemon::client::DaemonClient::connect().await?;
+            client.logs(&box_name, 0, follow, tail).await?;
+        }
+        Some(Commands::Restart) => {
+            let box_name = default_box_name();
+            let client = crate::daemon::client::DaemonClient::connect().await?;
+            client.restart(&box_name, 0).await?;
         }
     }
 
@@ -448,13 +426,38 @@ fn default_box_name() -> String {
         .to_string()
 }
 
+const DEFAULT_COOP_TOML: &str = r#"[sandbox]
+image = "debian:latest"
+agent = "claude"
+shell = "bash"
+user = "coop"
+
+setup = [
+  "DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y bash curl git ca-certificates",
+]
+
+mounts = [
+  "claude-config:~/.claude",
+]
+"#;
+
+async fn cmd_init() -> Result<()> {
+    let path = std::path::Path::new("coop.toml");
+    if path.exists() {
+        anyhow::bail!("coop.toml already exists in this directory");
+    }
+    std::fs::write(path, DEFAULT_COOP_TOML)?;
+    println!("Created coop.toml");
+    Ok(())
+}
+
 async fn cmd_attach(name: Option<String>) -> Result<()> {
     let client = crate::daemon::client::DaemonClient::connect().await?;
     let name = name.unwrap_or_else(default_box_name);
     client.attach(&name, 0).await
 }
 
-async fn cmd_shell(name: Option<String>, command: Option<&str>) -> Result<()> {
+async fn cmd_shell(name: Option<String>, command: Option<&str>, force_new: bool) -> Result<()> {
     let workspace = std::env::current_dir()
         .unwrap()
         .to_string_lossy()
@@ -465,8 +468,26 @@ async fn cmd_shell(name: Option<String>, command: Option<&str>) -> Result<()> {
 
     let client = crate::daemon::client::DaemonClient::connect().await?;
     client
-        .shell_or_create(name.as_deref(), &workspace, command)
+        .shell_or_create(name.as_deref(), &workspace, command, force_new)
         .await
+}
+
+async fn cmd_shell_attach(id: u32) -> Result<()> {
+    let box_name = default_box_name();
+    let client = crate::daemon::client::DaemonClient::connect().await?;
+    client.attach(&box_name, id).await
+}
+
+async fn cmd_shell_ls() -> Result<()> {
+    let box_name = default_box_name();
+    let client = crate::daemon::client::DaemonClient::connect().await?;
+    client.session_ls(&box_name).await
+}
+
+async fn cmd_shell_kill(id: u32) -> Result<()> {
+    let box_name = default_box_name();
+    let client = crate::daemon::client::DaemonClient::connect().await?;
+    client.session_kill(&box_name, id).await
 }
 
 async fn cmd_ls(json: bool) -> Result<()> {
@@ -482,6 +503,158 @@ async fn cmd_kill(name: Option<String>, all: bool, force: bool) -> Result<()> {
         let name = name.unwrap_or_else(default_box_name);
         client.kill(&name, force).await
     }
+}
+
+async fn cmd_system(action: SystemAction) -> Result<()> {
+    match action {
+        SystemAction::Status => {
+            let client = crate::daemon::client::DaemonClient::connect().await?;
+            client.status().await?;
+        }
+        SystemAction::Logs { follow, n } => {
+            crate::daemon::logs::tail_logs(follow, n).await?;
+        }
+        SystemAction::Shutdown => {
+            let client = crate::daemon::client::DaemonClient::connect().await?;
+            client.shutdown().await?;
+        }
+        SystemAction::Volumes => {
+            let volumes_dir = crate::config::coop_dir()?.join("volumes");
+            if !volumes_dir.exists() {
+                println!("No volumes.");
+                return Ok(());
+            }
+            let mut found = false;
+            for entry in std::fs::read_dir(&volumes_dir)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    let name = entry.file_name();
+                    let size = dir_size(&entry.path());
+                    println!("{:<30} {}", name.to_string_lossy(), format_size(size));
+                    found = true;
+                }
+            }
+            if !found {
+                println!("No volumes.");
+            }
+        }
+        SystemAction::VolumeRm { name } => {
+            let volumes_dir = crate::config::coop_dir()?.join("volumes");
+            let vol_path = volumes_dir.join(&name);
+            if vol_path.exists() {
+                std::fs::remove_dir_all(&vol_path)?;
+                println!("Removed volume: {}", name);
+            } else {
+                anyhow::bail!("Volume '{}' not found", name);
+            }
+        }
+        SystemAction::VolumePrune => {
+            let volumes_dir = crate::config::coop_dir()?.join("volumes");
+            if volumes_dir.exists() {
+                let mut count = 0;
+                for entry in std::fs::read_dir(&volumes_dir)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_dir() {
+                        std::fs::remove_dir_all(entry.path())?;
+                        count += 1;
+                    }
+                }
+                println!("Removed {} volume(s).", count);
+            } else {
+                println!("No volumes to prune.");
+            }
+        }
+        SystemAction::Df => {
+            let rootfs_path = crate::config::rootfs_base_path()?;
+            let oci_path = crate::config::oci_cache_dir()?;
+            let volumes_dir = crate::config::coop_dir()?.join("volumes");
+            let sessions_dir = crate::config::sessions_dir()?;
+
+            let mut total = 0u64;
+
+            if rootfs_path.exists() {
+                let size = dir_size(&rootfs_path);
+                total += size;
+                println!("Rootfs:     {}", format_size(size));
+            } else {
+                println!("Rootfs:     not built");
+            }
+            if oci_path.exists() {
+                let size = dir_size(&oci_path);
+                total += size;
+                println!("OCI cache:  {}", format_size(size));
+            } else {
+                println!("OCI cache:  empty");
+            }
+            if volumes_dir.exists() {
+                let size = dir_size(&volumes_dir);
+                total += size;
+                println!("Volumes:    {}", format_size(size));
+            } else {
+                println!("Volumes:    empty");
+            }
+            if sessions_dir.exists() {
+                let size = dir_size(&sessions_dir);
+                total += size;
+                println!("Sessions:   {}", format_size(size));
+            }
+            println!("Total:      {}", format_size(total));
+        }
+        SystemAction::Clean { all } => {
+            let rootfs_path = crate::config::rootfs_base_path()?;
+            let oci_path = crate::config::oci_cache_dir()?;
+            let mut removed = false;
+            if rootfs_path.exists() {
+                std::fs::remove_dir_all(&rootfs_path)?;
+                let manifest = crate::config::coop_dir()?.join("rootfs").join("manifest");
+                let _ = std::fs::remove_file(&manifest);
+                println!("Removed rootfs.");
+                removed = true;
+            }
+            if all && oci_path.exists() {
+                std::fs::remove_dir_all(&oci_path)?;
+                println!("Removed OCI cache.");
+                removed = true;
+            }
+            if !removed {
+                println!("Nothing to remove.");
+            }
+        }
+        SystemAction::Prune => {
+            let rootfs_path = crate::config::rootfs_base_path()?;
+            let oci_path = crate::config::oci_cache_dir()?;
+            let volumes_dir = crate::config::coop_dir()?.join("volumes");
+            let sessions_dir = crate::config::sessions_dir()?;
+
+            let mut removed = false;
+            if rootfs_path.exists() {
+                std::fs::remove_dir_all(&rootfs_path)?;
+                let manifest = crate::config::coop_dir()?.join("rootfs").join("manifest");
+                let _ = std::fs::remove_file(&manifest);
+                println!("Removed rootfs.");
+                removed = true;
+            }
+            if oci_path.exists() {
+                std::fs::remove_dir_all(&oci_path)?;
+                println!("Removed OCI cache.");
+                removed = true;
+            }
+            if volumes_dir.exists() {
+                std::fs::remove_dir_all(&volumes_dir)?;
+                println!("Removed all volumes.");
+                removed = true;
+            }
+            if sessions_dir.exists() {
+                std::fs::remove_dir_all(&sessions_dir)?;
+                println!("Removed all session data.");
+                removed = true;
+            }
+            if !removed {
+                println!("Nothing to remove.");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn dir_size(path: &std::path::Path) -> u64 {

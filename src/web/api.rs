@@ -108,7 +108,7 @@ async fn spawn_shell(
 
     match state
         .session_manager
-        .spawn_shell(&name, body.command, body.cols.unwrap_or(120), body.rows.unwrap_or(40))
+        .spawn_shell(&name, body.command, false, body.cols.unwrap_or(120), body.rows.unwrap_or(40))
         .await
     {
         Ok(resp) => Ok(Json(serde_json::to_value(resp).unwrap())),

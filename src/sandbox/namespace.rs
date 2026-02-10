@@ -123,11 +123,13 @@ pub fn create_session(
     let sandbox_user = &config.sandbox.user;
     let sandbox_home = format!("/home/{}", sandbox_user);
 
-    // Resolve extra mounts (host_path, container_path) before fork
+    // Resolve mounts before fork. Path-based mounts are direct bind mounts;
+    // named mounts (left side is a name, not a path) use managed storage.
     let mut extra_mounts: Vec<(PathBuf, String)> = config
         .sandbox
         .mounts
         .iter()
+        .filter(|m| !m.is_named_volume())
         .filter_map(|m| match m.resolve_with_home(&sandbox_home) {
             Ok(pair) => Some(pair),
             Err(e) => {
@@ -145,7 +147,7 @@ pub fn create_session(
         }
     }
 
-    // Resolve volumes
+    // Resolve named mounts (managed persistent storage)
     let session_volumes_dir = session_dir.join("volumes");
     std::fs::create_dir_all(&session_volumes_dir)?;
     let global_volumes_dir = config::coop_dir()?.join("volumes");
@@ -153,71 +155,39 @@ pub fn create_session(
 
     let volume_mounts: Vec<(PathBuf, String)> = config
         .sandbox
-        .volumes
+        .mounts
         .iter()
+        .filter(|m| m.is_named_volume())
         .filter_map(|m| {
             let container_path = match m.container_path(&sandbox_home) {
                 Ok(p) => p,
                 Err(e) => {
-                    eprintln!("coop: warning: skipping invalid volume: {}", e);
+                    eprintln!("coop: warning: skipping invalid mount: {}", e);
                     return None;
                 }
             };
 
-            if m.is_named_volume() {
-                // Named volume: stored globally in ~/.coop/volumes/<name>/
-                let vol_name = m.volume_name().unwrap();
-                let vol_dir = global_volumes_dir.join(&vol_name);
+            let vol_name = m.volume_name().unwrap();
+            let vol_dir = global_volumes_dir.join(&vol_name);
 
-                if !vol_dir.exists() {
-                    // Seed from host path equivalent to container path (e.g., ~/.claude)
-                    let host_equivalent = shellexpand::tilde(
-                        &container_path.replace(&sandbox_home, "~")
-                    ).to_string();
-                    let host_path = PathBuf::from(&host_equivalent);
+            if !vol_dir.exists() {
+                // Seed from host path equivalent to container path (e.g., ~/.claude)
+                let host_equivalent = shellexpand::tilde(
+                    &container_path.replace(&sandbox_home, "~")
+                ).to_string();
+                let host_path = PathBuf::from(&host_equivalent);
 
-                    if host_path.exists() && host_path.is_dir() {
-                        if let Err(e) = copy_dir_recursive(&host_path, &vol_dir) {
-                            eprintln!("coop: warning: failed to seed volume '{}' from {}: {}", vol_name, host_path.display(), e);
-                            let _ = std::fs::create_dir_all(&vol_dir);
-                        }
-                    } else {
+                if host_path.exists() && host_path.is_dir() {
+                    if let Err(e) = copy_dir_recursive(&host_path, &vol_dir) {
+                        eprintln!("coop: warning: failed to seed volume '{}' from {}: {}", vol_name, host_path.display(), e);
                         let _ = std::fs::create_dir_all(&vol_dir);
                     }
-                }
-
-                Some((vol_dir, container_path))
-            } else {
-                // Host-seeded volume: stored per-session
-                match m.resolve_with_home(&sandbox_home) {
-                    Ok((host_src, container_path)) => {
-                        let vol_name = container_path.trim_matches('/').replace('/', "--");
-                        let vol_path = session_volumes_dir.join(&vol_name);
-
-                        if !vol_path.exists() {
-                            if host_src.is_dir() {
-                                // Directory volume: vol_path becomes a directory
-                                if let Err(e) = copy_dir_recursive(&host_src, &vol_path) {
-                                    eprintln!("coop: warning: failed to seed volume from {}: {}", host_src.display(), e);
-                                    let _ = std::fs::create_dir_all(&vol_path);
-                                }
-                            } else if host_src.is_file() {
-                                // File volume: vol_path becomes the file itself (not a directory)
-                                let _ = std::fs::copy(&host_src, &vol_path);
-                            } else {
-                                // Source doesn't exist: create empty file placeholder
-                                let _ = std::fs::write(&vol_path, b"");
-                            }
-                        }
-
-                        Some((vol_path, container_path))
-                    }
-                    Err(e) => {
-                        eprintln!("coop: warning: skipping invalid volume: {}", e);
-                        None
-                    }
+                } else {
+                    let _ = std::fs::create_dir_all(&vol_dir);
                 }
             }
+
+            Some((vol_dir, container_path))
         })
         .collect();
 
