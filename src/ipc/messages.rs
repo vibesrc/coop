@@ -208,9 +208,13 @@ pub const FRAME_CONTROL: u8 = 0x01;
 
 pub const ERR_SESSION_NOT_FOUND: &str = "SESSION_NOT_FOUND";
 pub const ERR_SESSION_EXISTS: &str = "SESSION_EXISTS";
+#[allow(dead_code)]
 pub const ERR_PTY_NOT_FOUND: &str = "PTY_NOT_FOUND";
+#[allow(dead_code)]
 pub const ERR_INVALID_COMMAND: &str = "INVALID_COMMAND";
+#[allow(dead_code)]
 pub const ERR_VERSION_MISMATCH: &str = "VERSION_MISMATCH";
+#[allow(dead_code)]
 pub const ERR_MESSAGE_TOO_LARGE: &str = "MESSAGE_TOO_LARGE";
 
 impl Response {

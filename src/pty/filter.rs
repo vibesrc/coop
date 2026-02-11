@@ -33,14 +33,14 @@ impl InputFilter {
     pub fn new(ctrl_c_debounce_ms: u64, custom_block_sequences: &[String]) -> Self {
         let mut patterns: Vec<Vec<u8>> = vec![
             // Built-in blocked sequences
-            vec![0x04],               // Ctrl+D
-            vec![0x1c],               // Ctrl+\ (SIGQUIT)
-            b"exit\r".to_vec(),       // exit + enter
-            b"exit\n".to_vec(),       // exit + newline
-            b"/exit\r".to_vec(),      // /exit + enter
-            b"/exit\n".to_vec(),      // /exit + newline
-            b"quit\r".to_vec(),       // quit + enter
-            b"quit\n".to_vec(),       // quit + newline
+            vec![0x04],          // Ctrl+D
+            vec![0x1c],          // Ctrl+\ (SIGQUIT)
+            b"exit\r".to_vec(),  // exit + enter
+            b"exit\n".to_vec(),  // exit + newline
+            b"/exit\r".to_vec(), // /exit + enter
+            b"/exit\n".to_vec(), // /exit + newline
+            b"quit\r".to_vec(),  // quit + enter
+            b"quit\n".to_vec(),  // quit + newline
         ];
 
         // Add custom block sequences
@@ -134,6 +134,7 @@ impl InputFilter {
     }
 
     /// Flush any pending bytes (call on timeout)
+    #[allow(dead_code)]
     pub fn flush_pending(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending)
     }
@@ -148,10 +149,9 @@ fn parse_escape_sequence(s: &str) -> Vec<u8> {
     while i < bytes.len() {
         if i + 3 < bytes.len() && bytes[i] == b'\\' && bytes[i + 1] == b'x' {
             // Parse \xNN hex escape
-            if let Ok(byte) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 2..i + 4]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 2..i + 4]).unwrap_or(""), 16)
+            {
                 result.push(byte);
                 i += 4;
                 continue;

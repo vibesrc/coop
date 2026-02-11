@@ -26,7 +26,7 @@ pub struct TokenQuery {
 
 /// Verify the auth token from query param or Authorization header
 fn verify_token(state: &WebState, token: Option<&str>) -> bool {
-    token.map_or(false, |t| t == state.token)
+    token.is_some_and(|t| t == state.token)
 }
 
 async fn list_sessions(
@@ -108,7 +108,13 @@ async fn spawn_shell(
 
     match state
         .session_manager
-        .spawn_shell(&name, body.command, false, body.cols.unwrap_or(120), body.rows.unwrap_or(40))
+        .spawn_shell(
+            &name,
+            body.command,
+            false,
+            body.cols.unwrap_or(120),
+            body.rows.unwrap_or(40),
+        )
         .await
     {
         Ok(resp) => Ok(Json(serde_json::to_value(resp).unwrap())),

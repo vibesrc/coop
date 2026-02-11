@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// Connection envelope exchanged during signaling
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct ConnectionEnvelope {
     pub sdp: String,
     pub machine_id: String,
@@ -10,6 +11,7 @@ pub struct ConnectionEnvelope {
 }
 
 /// Get or create the machine ID
+#[allow(dead_code)]
 pub fn get_machine_id() -> anyhow::Result<String> {
     let path = crate::config::machine_id_path()?;
 
@@ -26,6 +28,7 @@ pub fn get_machine_id() -> anyhow::Result<String> {
 }
 
 /// Generate a QR code string for terminal display
+#[allow(dead_code)]
 pub fn generate_qr_terminal(data: &str) -> String {
     use qrcode::QrCode;
 

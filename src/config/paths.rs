@@ -19,6 +19,7 @@ pub fn pid_file_path() -> Result<PathBuf> {
 }
 
 /// Returns the daemon lock file path: ~/.coop/daemon.lock
+#[allow(dead_code)]
 pub fn lock_file_path() -> Result<PathBuf> {
     Ok(coop_dir()?.join("daemon.lock"))
 }
@@ -49,6 +50,7 @@ pub fn oci_cache_dir() -> Result<PathBuf> {
 }
 
 /// Returns the machine ID file path: ~/.coop/machine_id
+#[allow(dead_code)]
 pub fn machine_id_path() -> Result<PathBuf> {
     Ok(coop_dir()?.join("machine_id"))
 }

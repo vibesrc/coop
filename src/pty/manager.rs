@@ -5,17 +5,20 @@ use anyhow::Result;
 use tokio::sync::broadcast;
 
 /// Manages PTY master file descriptors and bridges them to clients.
+#[allow(dead_code)]
 pub struct PtyManager {
     ptys: HashMap<u32, PtyHandle>,
     next_id: u32,
 }
 
+#[allow(dead_code)]
 pub struct PtyHandle {
     pub id: u32,
     pub master_fd: RawFd,
     pub output_tx: broadcast::Sender<bytes::Bytes>,
 }
 
+#[allow(dead_code)]
 impl PtyManager {
     pub fn new() -> Self {
         Self {

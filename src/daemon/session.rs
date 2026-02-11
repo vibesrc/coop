@@ -10,12 +10,12 @@ use bytes::Bytes;
 use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 
 use crate::config::{self, Coopfile};
-use base64::Engine;
 use crate::ipc::{
     PtyInfo, PtyRole, Response, ResponseData, SessionInfo, ERR_SESSION_EXISTS,
     ERR_SESSION_NOT_FOUND,
 };
 use crate::sandbox::namespace;
+use base64::Engine;
 
 /// Max scrollback buffer size (256KB)
 const SCROLLBACK_MAX: usize = 256 * 1024;
@@ -39,7 +39,14 @@ pub struct PtyState {
 }
 
 impl PtyState {
-    fn new(id: u32, role: PtyRole, command: String, pid: u32, master_fd: RawFd, auto_restart: bool) -> (Self, oneshot::Receiver<()>) {
+    fn new(
+        id: u32,
+        role: PtyRole,
+        command: String,
+        pid: u32,
+        master_fd: RawFd,
+        auto_restart: bool,
+    ) -> (Self, oneshot::Receiver<()>) {
         let (output_tx, _) = broadcast::channel(256);
         let scrollback = Arc::new(Mutex::new(Vec::new()));
         let exit_rx = spawn_pty_reader(master_fd, output_tx.clone(), scrollback.clone());
@@ -91,14 +98,23 @@ pub struct Session {
 impl Drop for Session {
     fn drop(&mut self) {
         // Close pinned namespace fds to release the namespace
-        for fd in [self.ns_user_fd, self.ns_mnt_fd, self.ns_uts_fd, self.ns_root_fd] {
+        for fd in [
+            self.ns_user_fd,
+            self.ns_mnt_fd,
+            self.ns_uts_fd,
+            self.ns_root_fd,
+        ] {
             if fd >= 0 {
-                unsafe { nix::libc::close(fd); }
+                unsafe {
+                    nix::libc::close(fd);
+                }
             }
         }
         if let Some(fd) = self.ns_net_fd {
             if fd >= 0 {
-                unsafe { nix::libc::close(fd); }
+                unsafe {
+                    nix::libc::close(fd);
+                }
             }
         }
     }
@@ -175,9 +191,7 @@ fn spawn_pty_reader(
 
             match guard.try_io(|inner| {
                 let fd = inner.as_raw_fd();
-                let n = unsafe {
-                    nix::libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len())
-                };
+                let n = unsafe { nix::libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) };
                 if n < 0 {
                     Err(std::io::Error::last_os_error())
                 } else if n == 0 {
@@ -219,11 +233,7 @@ fn spawn_pty_reader(
 
 /// Check if a process is still alive via kill(pid, 0)
 fn is_pid_alive(pid: u32) -> bool {
-    nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid as i32),
-        None,
-    )
-    .is_ok()
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None).is_ok()
 }
 
 impl SessionManager {
@@ -238,6 +248,7 @@ impl SessionManager {
     }
 
     /// Rediscover orphaned sessions from a previous daemon by scanning /proc.
+    #[allow(dead_code)]
     pub async fn rediscover_sessions(&self) {
         let discovered = namespace::discover_sessions();
         let mut sessions = self.sessions.write().await;
@@ -313,7 +324,10 @@ impl SessionManager {
             if let Some(existing) = sessions.values().find(|s| s.workspace == workspace) {
                 return Ok(Response::err_with(
                     ERR_SESSION_EXISTS,
-                    format!("Session '{}' already exists for this workspace", existing.name),
+                    format!(
+                        "Session '{}' already exists for this workspace",
+                        existing.name
+                    ),
                     ResponseData {
                         session: Some(existing.name.clone()),
                         ..Default::default()
@@ -362,7 +376,11 @@ impl SessionManager {
         let sandbox_home = format!("/home/{}", sandbox_user);
         let default_shell = config.sandbox.shell_command().to_string();
         let sandbox_workspace = config.workspace.path.clone();
-        let user_env: Vec<(String, String)> = config.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let user_env: Vec<(String, String)> = config
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
 
         let auto_restart = config.session.auto_restart;
         let restart_delay_ms = config.session.restart_delay_ms;
@@ -465,9 +483,11 @@ impl SessionManager {
 
         // Unless forced, try to find an existing live shell running the same command
         if !force_new {
-            if let Some(existing) = session.ptys.iter().find(|p| {
-                p.role == PtyRole::Shell && p.command == cmd
-            }) {
+            if let Some(existing) = session
+                .ptys
+                .iter()
+                .find(|p| p.role == PtyRole::Shell && p.command == cmd)
+            {
                 return Ok(Response::ok_with(ResponseData {
                     pty: Some(existing.id),
                     ..Default::default()
@@ -538,7 +558,9 @@ impl SessionManager {
             .ptys
             .iter()
             .position(|p| p.id == pty_id)
-            .ok_or_else(|| anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name)
+            })?;
 
         let pty = &session.ptys[pty_idx];
 
@@ -705,7 +727,9 @@ impl SessionManager {
             .ptys
             .iter()
             .find(|p| p.id == pty_id)
-            .ok_or_else(|| anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name)
+            })?;
 
         let scrollback = pty
             .scrollback
@@ -758,13 +782,19 @@ impl SessionManager {
             .ptys
             .iter()
             .find(|p| p.id == pty_id)
-            .ok_or_else(|| anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name)
+            })?;
 
         let old_pid = pty.pid;
         let master_fd_ref = pty.master_fd.clone();
-        let output_tx = pty.output_tx.clone()
+        let output_tx = pty
+            .output_tx
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("PTY {} has no output channel", pty_id))?;
-        let scrollback = pty.scrollback.clone()
+        let scrollback = pty
+            .scrollback
+            .clone()
             .ok_or_else(|| anyhow::anyhow!("PTY {} has no scrollback buffer", pty_id))?;
 
         // Re-read coop.toml to pick up config changes
@@ -774,13 +804,21 @@ impl SessionManager {
 
         // Update session-level settings from fresh config
         session.default_shell = config.sandbox.shell_command().to_string();
-        session.user_env = config.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        session.user_env = config
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         session.restart_delay_ms = config.session.restart_delay_ms;
 
         // Determine the command: agent (PTY 0) picks up new agent command,
         // shells keep their original command
         let command = if pty_id == 0 {
-            let new_cmd = config.sandbox.agent_command().unwrap_or("claude").to_string();
+            let new_cmd = config
+                .sandbox
+                .agent_command()
+                .unwrap_or("claude")
+                .to_string();
             new_cmd
         } else {
             pty.command.clone()
@@ -838,11 +876,7 @@ impl SessionManager {
         let exit_rx = spawn_pty_reader(shell_ns.pty_master_fd, output_tx.clone(), scrollback);
 
         // Update PtyState in-place
-        let pty = session
-            .ptys
-            .iter_mut()
-            .find(|p| p.id == pty_id)
-            .unwrap();
+        let pty = session.ptys.iter_mut().find(|p| p.id == pty_id).unwrap();
         pty.pid = Some(shell_ns.shell_pid);
         pty.command = command;
         pty.auto_restart = auto_restart;
@@ -888,7 +922,11 @@ impl SessionManager {
         &self,
         session_name: &str,
         pty_id: u32,
-    ) -> Result<(Arc<AtomicI32>, broadcast::Sender<Bytes>, Option<Arc<Mutex<Vec<u8>>>>)> {
+    ) -> Result<(
+        Arc<AtomicI32>,
+        broadcast::Sender<Bytes>,
+        Option<Arc<Mutex<Vec<u8>>>>,
+    )> {
         let sessions = self.sessions.read().await;
         let session = self.resolve_session(&sessions, session_name)?;
 
@@ -896,7 +934,9 @@ impl SessionManager {
             .ptys
             .iter()
             .find(|p| p.id == pty_id)
-            .ok_or_else(|| anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name)
+            })?;
 
         let output_tx = pty
             .output_tx
@@ -950,6 +990,7 @@ impl SessionManager {
     /// Spawn a background task that watches for a PTY to exit.
     /// If auto_restart is true, restarts the process after a delay.
     /// Otherwise, cleans up the dead PTY.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_exit_watcher(
         self: &Arc<Self>,
         exit_rx: oneshot::Receiver<()>,
@@ -983,8 +1024,12 @@ impl SessionManager {
                 }
 
                 match sm.restart_pty(&session_name, pty_id).await {
-                    Ok(_) => tracing::info!(session = %session_name, pty = pty_id, "Auto-restarted PTY"),
-                    Err(e) => tracing::error!(session = %session_name, pty = pty_id, error = %e, "Failed to auto-restart PTY"),
+                    Ok(_) => {
+                        tracing::info!(session = %session_name, pty = pty_id, "Auto-restarted PTY")
+                    }
+                    Err(e) => {
+                        tracing::error!(session = %session_name, pty = pty_id, error = %e, "Failed to auto-restart PTY")
+                    }
                 }
             } else {
                 tracing::info!(session = %session_name, pty = pty_id, "PTY exited, cleaning up");

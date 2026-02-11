@@ -280,13 +280,9 @@ async fn handle_client(
                 let token_clone = token.clone();
                 let host_clone = host.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = crate::web::server::start_web_server(
-                        &host_clone,
-                        port,
-                        sm,
-                        token_clone,
-                    )
-                    .await
+                    if let Err(e) =
+                        crate::web::server::start_web_server(&host_clone, port, sm, token_clone)
+                            .await
                     {
                         tracing::error!(error = %e, "Web server error");
                     }
@@ -298,18 +294,15 @@ async fn handle_client(
                     ..Default::default()
                 }))
             }
-            Command::SessionLs { session } => {
-                session_manager.session_ls(&session).await
-            }
-            Command::SessionKill { session, pty } => {
-                session_manager.kill_pty(&session, pty).await
-            }
-            Command::Logs { session, pty, tail_lines, .. } => {
-                session_manager.get_logs(&session, pty, tail_lines).await
-            }
-            Command::Restart { session, pty } => {
-                session_manager.restart_pty(&session, pty).await
-            }
+            Command::SessionLs { session } => session_manager.session_ls(&session).await,
+            Command::SessionKill { session, pty } => session_manager.kill_pty(&session, pty).await,
+            Command::Logs {
+                session,
+                pty,
+                tail_lines,
+                ..
+            } => session_manager.get_logs(&session, pty, tail_lines).await,
+            Command::Restart { session, pty } => session_manager.restart_pty(&session, pty).await,
             Command::Shutdown => {
                 let _ = shutdown_tx.send(());
                 Ok(Response::ok())
@@ -368,8 +361,7 @@ async fn handle_stream_mode(
 ) -> Result<()> {
     session_manager.add_local_client(&target.session).await;
 
-    let result =
-        handle_stream_mode_inner(msg_parts, target, session_manager.clone()).await;
+    let result = handle_stream_mode_inner(msg_parts, target, session_manager.clone()).await;
 
     session_manager.remove_local_client(&target.session).await;
 
@@ -411,7 +403,8 @@ async fn handle_stream_mode_inner(
     if let Some(sb) = &scrollback {
         let data = sb.lock().await;
         if !data.is_empty() {
-            sink.send(StreamFrame::pty_data(Bytes::copy_from_slice(&data))).await?;
+            sink.send(StreamFrame::pty_data(Bytes::copy_from_slice(&data)))
+                .await?;
         }
     }
 

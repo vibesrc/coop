@@ -36,12 +36,7 @@ async fn ws_handler(
         .into_response()
 }
 
-async fn handle_socket(
-    socket: WebSocket,
-    state: Arc<WebState>,
-    session: String,
-    pty: u32,
-) {
+async fn handle_socket(socket: WebSocket, state: Arc<WebState>, session: String, pty: u32) {
     tracing::info!(session = %session, pty = pty, "WebSocket connected");
 
     if let Err(e) = handle_socket_inner(socket, &state, &session, pty).await {
@@ -58,10 +53,8 @@ async fn handle_socket_inner(
     pty: u32,
 ) -> anyhow::Result<()> {
     // Look up session and PTY handles
-    let (master_fd, output_tx, scrollback) = state
-        .session_manager
-        .get_pty_handle(session, pty)
-        .await?;
+    let (master_fd, output_tx, scrollback) =
+        state.session_manager.get_pty_handle(session, pty).await?;
 
     // Track web client
     state.session_manager.add_web_client(session).await;
@@ -86,9 +79,7 @@ async fn handle_socket_inner(
     if let Some(sb) = &scrollback {
         let data = sb.lock().await;
         if !data.is_empty() {
-            let _ = ws_sink
-                .send(Message::Binary(data.clone().into()))
-                .await;
+            let _ = ws_sink.send(Message::Binary(data.clone().into())).await;
         }
     }
 
@@ -167,9 +158,8 @@ async fn handle_socket_inner(
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                         // PTY exited
-                        let msg = format!(
-                            "\r\n\x1b[2m[process exited]\x1b[0m\r\n"
-                        );
+                        let msg =
+                            "\r\n\x1b[2m[process exited]\x1b[0m\r\n".to_string();
                         let _ = ws_sink.send(Message::Binary(msg.into_bytes().into())).await;
                         break;
                     }

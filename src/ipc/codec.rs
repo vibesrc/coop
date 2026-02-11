@@ -21,7 +21,10 @@ impl Decoder for MessageCodec {
         if length > MAX_MESSAGE_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Message too large: {} bytes (max {})", length, MAX_MESSAGE_SIZE),
+                format!(
+                    "Message too large: {} bytes (max {})",
+                    length, MAX_MESSAGE_SIZE
+                ),
             ));
         }
 
@@ -42,7 +45,11 @@ impl Encoder<bytes::Bytes> for MessageCodec {
         if item.len() > MAX_MESSAGE_SIZE {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Message too large: {} bytes (max {})", item.len(), MAX_MESSAGE_SIZE),
+                format!(
+                    "Message too large: {} bytes (max {})",
+                    item.len(),
+                    MAX_MESSAGE_SIZE
+                ),
             ));
         }
 

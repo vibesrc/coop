@@ -2,7 +2,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "coop", version, about = "Sandboxed AI agent sessions with remote access")]
+#[command(
+    name = "coop",
+    version,
+    about = "Sandboxed AI agent sessions with remote access"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -303,9 +307,12 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         None => {
             // Smart default: create or attach
-            let workspace = cli
-                .workspace
-                .unwrap_or_else(|| std::env::current_dir().unwrap().to_string_lossy().to_string());
+            let workspace = cli.workspace.unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            });
             tracing::info!(workspace = %workspace, "Smart default: create or attach");
 
             // Ensure rootfs exists (first run auto-builds, --build forces rebuild)
@@ -319,7 +326,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .await?;
             } else {
                 // Try attach first, create if not found
-                match client.attach_or_create(cli.name.as_deref(), &workspace).await {
+                match client
+                    .attach_or_create(cli.name.as_deref(), &workspace)
+                    .await
+                {
                     Ok(()) => {}
                     Err(e) => {
                         tracing::error!(error = %e, "Failed to create/attach box");
@@ -329,7 +339,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         Some(Commands::Attach { name }) => cmd_attach(name).await?,
-        Some(Commands::Shell { action, command, new }) => {
+        Some(Commands::Shell {
+            action,
+            command,
+            new,
+        }) => {
             match action {
                 None => cmd_shell(None, command.as_deref(), new).await?,
                 Some(ShellAction::Ls) => cmd_shell_ls().await?,
@@ -351,14 +365,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Some(Commands::Ls { json }) => cmd_ls(json).await?,
         Some(Commands::Kill { name, all, force }) => cmd_kill(name, all, force).await?,
-        Some(Commands::Box { action }) => {
-            match action {
-                BoxAction::Ls { json } => cmd_ls(json).await?,
-                BoxAction::Attach { name } => cmd_attach(name).await?,
-                BoxAction::Shell { name, command, new } => cmd_shell(name, command.as_deref(), new).await?,
-                BoxAction::Kill { name, all, force } => cmd_kill(name, all, force).await?,
+        Some(Commands::Box { action }) => match action {
+            BoxAction::Ls { json } => cmd_ls(json).await?,
+            BoxAction::Attach { name } => cmd_attach(name).await?,
+            BoxAction::Shell { name, command, new } => {
+                cmd_shell(name, command.as_deref(), new).await?
             }
-        }
+            BoxAction::Kill { name, all, force } => cmd_kill(name, all, force).await?,
+        },
         Some(Commands::Init) => {
             cmd_init().await?;
         }
@@ -392,21 +406,19 @@ pub async fn run(cli: Cli) -> Result<()> {
             let client = crate::daemon::client::DaemonClient::connect().await?;
             client.tunnel(stun.as_deref(), no_stun, no_qr).await?;
         }
-        Some(Commands::Session { action }) => {
-            match action {
-                SessionAction::Ls { name } => {
-                    let client = crate::daemon::client::DaemonClient::connect().await?;
-                    match name {
-                        Some(n) => client.session_ls(&n).await?,
-                        None => client.session_ls_all().await?,
-                    }
-                }
-                SessionAction::Kill { name, pty } => {
-                    let client = crate::daemon::client::DaemonClient::connect().await?;
-                    client.session_kill(&name, pty).await?;
+        Some(Commands::Session { action }) => match action {
+            SessionAction::Ls { name } => {
+                let client = crate::daemon::client::DaemonClient::connect().await?;
+                match name {
+                    Some(n) => client.session_ls(&n).await?,
+                    None => client.session_ls_all().await?,
                 }
             }
-        }
+            SessionAction::Kill { name, pty } => {
+                let client = crate::daemon::client::DaemonClient::connect().await?;
+                client.session_kill(&name, pty).await?;
+            }
+        },
         Some(Commands::System { action }) => {
             cmd_system(action).await?;
         }

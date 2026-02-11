@@ -153,13 +153,22 @@ fn pull_oci_image(image: &str, target: &Path) -> Result<()> {
             };
 
             let status = Command::new(&skopeo)
-                .args(["copy", &docker_ref, &format!("oci:{}:latest", oci_dir.display())])
+                .args([
+                    "copy",
+                    &docker_ref,
+                    &format!("oci:{}:latest", oci_dir.display()),
+                ])
                 .status()
                 .context("Failed to run skopeo")?;
 
             if status.success() {
                 let status = Command::new(&umoci)
-                    .args(["unpack", "--image", &format!("{}:latest", oci_dir.display()), &target.display().to_string()])
+                    .args([
+                        "unpack",
+                        "--image",
+                        &format!("{}:latest", oci_dir.display()),
+                        &target.display().to_string(),
+                    ])
                     .status()
                     .context("Failed to run umoci")?;
 
@@ -209,9 +218,7 @@ fn pull_oci_image(image: &str, target: &Path) -> Result<()> {
     for runtime in &["docker", "podman"] {
         if let Ok(rt) = which(runtime) {
             println!("  Pulling with {}...", runtime);
-            let pull = Command::new(&rt)
-                .args(["pull", image])
-                .status();
+            let pull = Command::new(&rt).args(["pull", image]).status();
             if !matches!(pull, Ok(s) if s.success()) {
                 continue;
             }
@@ -278,14 +285,22 @@ fn run_in_rootfs(rootfs: &Path, cmd: &str) -> Result<()> {
 
     match unsafe { nix::unistd::fork() }.context("fork() for rootfs command failed")? {
         ForkResult::Parent { child } => {
-            unsafe { nix::libc::close(pipe1_wr); }
-            unsafe { nix::libc::close(pipe2_rd); }
-            unsafe { nix::libc::close(out_wr); }
+            unsafe {
+                nix::libc::close(pipe1_wr);
+            }
+            unsafe {
+                nix::libc::close(pipe2_rd);
+            }
+            unsafe {
+                nix::libc::close(out_wr);
+            }
 
             // Wait for child to unshare() before writing UID/GID maps
             let mut buf = [0u8; 1];
             let _ = nix::unistd::read(pipe1_rd, &mut buf);
-            unsafe { nix::libc::close(pipe1_rd); }
+            unsafe {
+                nix::libc::close(pipe1_rd);
+            }
 
             // Write UID/GID maps
             super::namespace::setup_uid_map(child)?;
@@ -304,7 +319,9 @@ fn run_in_rootfs(rootfs: &Path, cmd: &str) -> Result<()> {
                     Ok(n) => output.extend_from_slice(&read_buf[..n]),
                 }
             }
-            unsafe { nix::libc::close(out_rd); }
+            unsafe {
+                nix::libc::close(out_rd);
+            }
 
             // Wait for child to complete
             match nix::sys::wait::waitpid(child, None) {
@@ -328,20 +345,27 @@ fn run_in_rootfs(rootfs: &Path, cmd: &str) -> Result<()> {
             }
         }
         ForkResult::Child => {
-            unsafe { nix::libc::close(pipe1_rd); }
-            unsafe { nix::libc::close(pipe2_wr); }
-            unsafe { nix::libc::close(out_rd); }
+            unsafe {
+                nix::libc::close(pipe1_rd);
+            }
+            unsafe {
+                nix::libc::close(pipe2_wr);
+            }
+            unsafe {
+                nix::libc::close(out_rd);
+            }
 
             // Redirect stdout and stderr to the output capture pipe
             unsafe {
                 nix::libc::dup2(out_wr, 1);
                 nix::libc::dup2(out_wr, 2);
-                if out_wr > 2 { nix::libc::close(out_wr); }
+                if out_wr > 2 {
+                    nix::libc::close(out_wr);
+                }
             }
 
             // Unshare user + mount namespaces
-            if let Err(e) =
-                nix::sched::unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)
+            if let Err(e) = nix::sched::unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS)
             {
                 eprintln!("coop init: unshare failed: {}", e);
                 std::process::exit(1);
@@ -355,7 +379,9 @@ fn run_in_rootfs(rootfs: &Path, cmd: &str) -> Result<()> {
             // Wait for parent to write UID/GID maps
             let mut buf = [0u8; 1];
             let _ = nix::unistd::read(pipe2_rd, &mut buf);
-            unsafe { nix::libc::close(pipe2_rd); }
+            unsafe {
+                nix::libc::close(pipe2_rd);
+            }
 
             // chroot into rootfs
             if let Err(e) = nix::unistd::chroot(&rootfs_owned) {
@@ -426,7 +452,10 @@ fn run_in_rootfs(rootfs: &Path, cmd: &str) -> Result<()> {
 
             // Ensure DNS and hostname resolution work
             let _ = std::fs::create_dir_all("/etc");
-            let _ = std::fs::write("/etc/resolv.conf", "nameserver 8.8.8.8\nnameserver 8.8.4.4\n");
+            let _ = std::fs::write(
+                "/etc/resolv.conf",
+                "nameserver 8.8.8.8\nnameserver 8.8.4.4\n",
+            );
             let _ = std::fs::write("/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n");
 
             // Disable apt privilege dropping
@@ -439,12 +468,12 @@ fn run_in_rootfs(rootfs: &Path, cmd: &str) -> Result<()> {
             // Exec the command via /bin/sh -c
             let sh = CString::new("/bin/sh").unwrap();
             let c_flag = CString::new("-c").unwrap();
-            let c_cmd = CString::new(cmd_owned.as_str()).unwrap_or_else(|_| {
-                CString::new("true").unwrap()
-            });
+            let c_cmd =
+                CString::new(cmd_owned.as_str()).unwrap_or_else(|_| CString::new("true").unwrap());
 
             let env: Vec<CString> = vec![
-                CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin").unwrap(),
+                CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+                    .unwrap(),
                 CString::new("HOME=/root").unwrap(),
                 CString::new("TERM=dumb").unwrap(),
                 CString::new("DEBIAN_FRONTEND=noninteractive").unwrap(),
@@ -457,7 +486,6 @@ fn run_in_rootfs(rootfs: &Path, cmd: &str) -> Result<()> {
         }
     }
 }
-
 
 /// Create a minimal rootfs structure (used when no OCI tools are available)
 fn create_minimal_rootfs(path: &Path) -> Result<()> {
@@ -496,11 +524,11 @@ fn create_minimal_rootfs(path: &Path) -> Result<()> {
         path.join("etc/passwd"),
         "root:x:0:0:root:/root:/bin/sh\nuser:x:1000:1000:user:/home/user:/bin/sh\n",
     )?;
+    std::fs::write(path.join("etc/group"), "root:x:0:\nuser:x:1000:\n")?;
     std::fs::write(
-        path.join("etc/group"),
-        "root:x:0:\nuser:x:1000:\n",
+        path.join("etc/resolv.conf"),
+        "nameserver 8.8.8.8\nnameserver 8.8.4.4\n",
     )?;
-    std::fs::write(path.join("etc/resolv.conf"), "nameserver 8.8.8.8\nnameserver 8.8.4.4\n")?;
     std::fs::write(
         path.join("etc/nsswitch.conf"),
         "passwd: files\ngroup: files\nhosts: files dns\n",
@@ -526,8 +554,7 @@ fn copy_host_binary(host_path: &str, rootfs: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    std::fs::copy(src, &dest)
-        .with_context(|| format!("Failed to copy {} to rootfs", host_path))?;
+    std::fs::copy(src, &dest).with_context(|| format!("Failed to copy {} to rootfs", host_path))?;
 
     // Copy shared library dependencies (basic ldd parsing)
     if let Ok(output) = Command::new("ldd").arg(host_path).output() {
@@ -536,7 +563,7 @@ fn copy_host_binary(host_path: &str, rootfs: &Path) -> Result<()> {
             for line in stdout.lines() {
                 // Parse lines like: "libfoo.so => /lib/x86_64-linux-gnu/libfoo.so (0x...)"
                 if let Some(path_str) = line.split("=>").nth(1) {
-                    let path_str = path_str.trim().split_whitespace().next().unwrap_or("");
+                    let path_str = path_str.split_whitespace().next().unwrap_or("");
                     if !path_str.is_empty() && Path::new(path_str).exists() {
                         let lib_dest = rootfs.join(path_str.trim_start_matches('/'));
                         if let Some(parent) = lib_dest.parent() {

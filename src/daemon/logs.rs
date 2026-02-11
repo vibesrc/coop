@@ -8,8 +8,7 @@ pub async fn tail_logs(_follow: bool, n: usize) -> Result<()> {
         return Ok(());
     }
 
-    let content =
-        std::fs::read_to_string(&log_path).context("Failed to read daemon log")?;
+    let content = std::fs::read_to_string(&log_path).context("Failed to read daemon log")?;
 
     let lines: Vec<&str> = content.lines().collect();
     let start = lines.len().saturating_sub(n);

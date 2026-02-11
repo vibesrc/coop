@@ -17,6 +17,7 @@ pub struct SessionNamespace {
     /// Master side of the PTY allocated for the agent
     pub pty_master_fd: RawFd,
     /// Session name
+    #[allow(dead_code)]
     pub name: String,
     /// Pinned namespace fds — keep these alive so the namespace persists
     /// even after the init process exits (needed for restart).
@@ -29,6 +30,7 @@ pub struct SessionNamespace {
 
 /// Information about a discovered session from /proc scanning
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct DiscoveredSession {
     pub name: String,
     pub workspace: String,
@@ -42,9 +44,7 @@ pub fn namespace_flags(network_mode: NetworkMode) -> CloneFlags {
     // in the new PID namespace (not the caller), which prevents the shell
     // from forking. A double-fork after unshare would fix this but adds
     // complexity. For now, user+mount+uts provides sufficient isolation.
-    let mut flags = CloneFlags::CLONE_NEWUSER
-        | CloneFlags::CLONE_NEWNS
-        | CloneFlags::CLONE_NEWUTS;
+    let mut flags = CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWUTS;
 
     if network_mode != NetworkMode::Host {
         flags |= CloneFlags::CLONE_NEWNET;
@@ -89,21 +89,21 @@ pub fn create_session(
     // Pipe 1 (child→parent): child signals after unshare(), parent then writes UID/GID maps
     // Pipe 2 (parent→child): parent signals after writing maps, child then proceeds
     // Pipe 3 (child→parent): child signals after fs setup complete (overlayfs+pivot_root done)
-    let (pipe1_rd_owned, pipe1_wr_owned) = nix::unistd::pipe().context("Failed to create sync pipe 1")?;
+    let (pipe1_rd_owned, pipe1_wr_owned) =
+        nix::unistd::pipe().context("Failed to create sync pipe 1")?;
     let pipe1_rd = pipe1_rd_owned.into_raw_fd(); // parent reads
     let pipe1_wr = pipe1_wr_owned.into_raw_fd(); // child writes
-    let (pipe2_rd_owned, pipe2_wr_owned) = nix::unistd::pipe().context("Failed to create sync pipe 2")?;
+    let (pipe2_rd_owned, pipe2_wr_owned) =
+        nix::unistd::pipe().context("Failed to create sync pipe 2")?;
     let pipe2_rd = pipe2_rd_owned.into_raw_fd(); // child reads
     let pipe2_wr = pipe2_wr_owned.into_raw_fd(); // parent writes
-    let (pipe3_rd_owned, pipe3_wr_owned) = nix::unistd::pipe().context("Failed to create sync pipe 3")?;
+    let (pipe3_rd_owned, pipe3_wr_owned) =
+        nix::unistd::pipe().context("Failed to create sync pipe 3")?;
     let pipe3_rd = pipe3_rd_owned.into_raw_fd(); // parent reads
     let pipe3_wr = pipe3_wr_owned.into_raw_fd(); // child writes
 
     // Resolve the agent command before forking
-    let agent_cmd = config
-        .sandbox
-        .agent_command()
-        .unwrap_or("claude");
+    let agent_cmd = config.sandbox.agent_command().unwrap_or("claude");
     let agent_args = &config.sandbox.args;
     let workspace_path = &config.workspace.path;
     let persist_dirs = &config.session.persist;
@@ -183,14 +183,18 @@ pub fn create_session(
 
             if !vol_dir.exists() {
                 // Seed from host path equivalent to container path (e.g., ~/.claude)
-                let host_equivalent = shellexpand::tilde(
-                    &container_path.replace(&sandbox_home, "~")
-                ).to_string();
+                let host_equivalent =
+                    shellexpand::tilde(&container_path.replace(&sandbox_home, "~")).to_string();
                 let host_path = PathBuf::from(&host_equivalent);
 
                 if host_path.exists() && host_path.is_dir() {
                     if let Err(e) = copy_dir_recursive(&host_path, &vol_dir) {
-                        eprintln!("coop: warning: failed to seed volume '{}' from {}: {}", vol_name, host_path.display(), e);
+                        eprintln!(
+                            "coop: warning: failed to seed volume '{}' from {}: {}",
+                            vol_name,
+                            host_path.display(),
+                            e
+                        );
                         let _ = std::fs::create_dir_all(&vol_dir);
                     }
                 } else {
@@ -228,8 +232,7 @@ pub fn create_session(
 
             // Signal child that maps are ready
             let wr_fd = unsafe { OwnedFd::from_raw_fd(pipe2_wr) };
-            nix::unistd::write(&wr_fd, &[1u8])
-                .context("Failed to signal child")?;
+            nix::unistd::write(&wr_fd, &[1u8]).context("Failed to signal child")?;
             drop(wr_fd);
 
             // Wait for child to finish filesystem setup (overlayfs + pivot_root)
@@ -242,14 +245,20 @@ pub fn create_session(
             // init process exits. This allows restart_pty to nsenter later.
             let child_pid = child.as_raw() as u32;
             let ns_user_fd = std::fs::File::open(format!("/proc/{}/ns/user", child_pid))
-                .context("Failed to pin user namespace fd")?.into_raw_fd();
+                .context("Failed to pin user namespace fd")?
+                .into_raw_fd();
             let ns_mnt_fd = std::fs::File::open(format!("/proc/{}/ns/mnt", child_pid))
-                .context("Failed to pin mount namespace fd")?.into_raw_fd();
+                .context("Failed to pin mount namespace fd")?
+                .into_raw_fd();
             let ns_uts_fd = std::fs::File::open(format!("/proc/{}/ns/uts", child_pid))
-                .context("Failed to pin UTS namespace fd")?.into_raw_fd();
+                .context("Failed to pin UTS namespace fd")?
+                .into_raw_fd();
             let ns_net_fd = if network_mode != NetworkMode::Host {
-                Some(std::fs::File::open(format!("/proc/{}/ns/net", child_pid))
-                    .context("Failed to pin net namespace fd")?.into_raw_fd())
+                Some(
+                    std::fs::File::open(format!("/proc/{}/ns/net", child_pid))
+                        .context("Failed to pin net namespace fd")?
+                        .into_raw_fd(),
+                )
             } else {
                 None
             };
@@ -257,7 +266,8 @@ pub fn create_session(
                 format!("/proc/{}/root", child_pid).as_str(),
                 nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_DIRECTORY,
                 nix::sys::stat::Mode::empty(),
-            ).context("Failed to pin namespace root fd")?;
+            )
+            .context("Failed to pin namespace root fd")?;
 
             Ok(SessionNamespace {
                 child_pid,
@@ -291,7 +301,9 @@ pub fn create_session(
             // Wait for parent to write UID/GID maps
             let mut buf = [0u8; 1];
             let _ = nix::unistd::read(pipe2_rd, &mut buf);
-            unsafe { nix::libc::close(pipe2_rd); }
+            unsafe {
+                nix::libc::close(pipe2_rd);
+            }
 
             // Redirect child stderr to a log file for debugging
             // (daemon stderr goes to /dev/null so child errors are otherwise lost)
@@ -304,8 +316,14 @@ pub fn create_session(
                 {
                     use std::os::unix::io::IntoRawFd;
                     let fd = f.into_raw_fd();
-                    unsafe { nix::libc::dup2(fd, 2); }
-                    if fd > 2 { unsafe { nix::libc::close(fd); } }
+                    unsafe {
+                        nix::libc::dup2(fd, 2);
+                    }
+                    if fd > 2 {
+                        unsafe {
+                            nix::libc::close(fd);
+                        }
+                    }
                 }
             }
 
@@ -350,7 +368,10 @@ pub fn create_session(
             std::env::set_var("COOP_CREATED", now.to_string());
 
             // Build env vars vec for entrypoint
-            let env_vars: Vec<(String, String)> = user_env_owned.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            let env_vars: Vec<(String, String)> = user_env_owned
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
 
             child_entrypoint(
                 slave_fd,
@@ -381,16 +402,24 @@ pub fn setup_uid_map(child_pid: Pid) -> Result<()> {
         let uid_status = std::process::Command::new("newuidmap")
             .args([
                 &pid.to_string(),
-                "0", &uid.to_string(), "1",
-                "1", &sub_uid.0.to_string(), &sub_uid.1.to_string(),
+                "0",
+                &uid.to_string(),
+                "1",
+                "1",
+                &sub_uid.0.to_string(),
+                &sub_uid.1.to_string(),
             ])
             .status();
 
         let gid_status = std::process::Command::new("newgidmap")
             .args([
                 &pid.to_string(),
-                "0", &gid.to_string(), "1",
-                "1", &sub_gid.0.to_string(), &sub_gid.1.to_string(),
+                "0",
+                &gid.to_string(),
+                "1",
+                "1",
+                &sub_gid.0.to_string(),
+                &sub_gid.1.to_string(),
             ])
             .status();
 
@@ -423,8 +452,8 @@ fn get_subid(path: &str) -> Result<(u64, u64)> {
     let username = std::env::var("USER").unwrap_or_default();
     let uid_str = nix::unistd::getuid().to_string();
 
-    let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read {}", path))?;
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("Failed to read {}", path))?;
 
     for line in content.lines() {
         let parts: Vec<&str> = line.split(':').collect();
@@ -440,6 +469,7 @@ fn get_subid(path: &str) -> Result<(u64, u64)> {
 
 /// Child-side filesystem setup: overlay, bind mounts, pivot_root
 /// Falls back to bind-mount + chroot when overlayfs is not available (e.g. WSL2 user namespaces).
+#[allow(clippy::too_many_arguments)]
 fn child_setup_fs(
     base_path: &Path,
     upper_path: &Path,
@@ -485,7 +515,15 @@ fn child_setup_fs(
     };
 
     // Set up bind mounts inside the root
-    setup_bind_mounts(&root, workspace_host, workspace_path, persist_dirs, persist_path, extra_mounts, sandbox_home)?;
+    setup_bind_mounts(
+        &root,
+        workspace_host,
+        workspace_path,
+        persist_dirs,
+        persist_path,
+        extra_mounts,
+        sandbox_home,
+    )?;
 
     // Set up the sandbox user (uid 0 mapped to host user, named per config)
     setup_sandbox_user(&root, sandbox_user, sandbox_home)?;
@@ -582,7 +620,10 @@ pub fn setup_bind_mounts(
         None::<&str>,
     ) {
         // Try bind-mounting the host /proc instead
-        eprintln!("coop: mounting new /proc failed ({}), bind-mounting host /proc", e);
+        eprintln!(
+            "coop: mounting new /proc failed ({}), bind-mounting host /proc",
+            e
+        );
         let _ = nix::mount::mount(
             Some("/proc"),
             &proc_path,
@@ -635,7 +676,10 @@ pub fn setup_bind_mounts(
     // Extra bind mounts from coop.toml [[mounts]]
     for (host_path, container_path) in extra_mounts {
         if !host_path.exists() {
-            eprintln!("coop: warning: mount source does not exist, skipping: {}", host_path.display());
+            eprintln!(
+                "coop: warning: mount source does not exist, skipping: {}",
+                host_path.display()
+            );
             continue;
         }
         let target = root.join(container_path.trim_start_matches('/'));
@@ -654,7 +698,13 @@ pub fn setup_bind_mounts(
             nix::mount::MsFlags::MS_BIND | nix::mount::MsFlags::MS_REC,
             None::<&str>,
         )
-        .with_context(|| format!("Failed to bind-mount {} -> {}", host_path.display(), container_path))?;
+        .with_context(|| {
+            format!(
+                "Failed to bind-mount {} -> {}",
+                host_path.display(),
+                container_path
+            )
+        })?;
     }
 
     // Bind-mount persist directories (skip if an explicit mount already covers the path)
@@ -664,7 +714,10 @@ pub fn setup_bind_mounts(
         let target_str = format!("{}/{}", sandbox_home, dir);
 
         // Skip if an explicit extra mount already targets this path
-        if extra_mounts.iter().any(|(_, cp)| cp.trim_end_matches('/') == target_str.trim_end_matches('/')) {
+        if extra_mounts
+            .iter()
+            .any(|(_, cp)| cp.trim_end_matches('/') == target_str.trim_end_matches('/'))
+        {
             continue;
         }
 
@@ -697,7 +750,9 @@ fn setup_sandbox_user(root: &Path, user: &str, home: &str) -> Result<()> {
 
     std::fs::write(
         etc.join("passwd"),
-        format!("{user}:x:0:0:{user}:{home}:/bin/sh\nnobody:x:65534:65534:nobody:/:/sbin/nologin\n"),
+        format!(
+            "{user}:x:0:0:{user}:{home}:/bin/sh\nnobody:x:65534:65534:nobody:/:/sbin/nologin\n"
+        ),
     )?;
 
     std::fs::write(
@@ -708,10 +763,7 @@ fn setup_sandbox_user(root: &Path, user: &str, home: &str) -> Result<()> {
     std::fs::write(etc.join("shadow"), format!("{user}:!:0::::::\n"))?;
 
     // Hostname resolution (needed for OAuth callbacks, localhost binding, etc.)
-    std::fs::write(
-        etc.join("hosts"),
-        "127.0.0.1 localhost\n::1 localhost\n",
-    )?;
+    std::fs::write(etc.join("hosts"), "127.0.0.1 localhost\n::1 localhost\n")?;
 
     // DNS resolution
     std::fs::write(
@@ -786,6 +838,7 @@ pub struct ShellNamespace {
 /// Uses pre-opened (pinned) namespace fds from session creation. These fds keep
 /// the namespace alive even after the original init process exits — critical for
 /// restart support. Uses fchdir+chroot(".") to enter the sandboxed root.
+#[allow(clippy::too_many_arguments)]
 pub fn nsenter_shell(
     ns_user_fd: RawFd,
     ns_mnt_fd: RawFd,
@@ -927,8 +980,7 @@ fn child_entrypoint(
     let _ = std::env::set_current_dir(cwd);
 
     // Exec the command
-    let cmd = CString::new(cmd_str)
-        .unwrap_or_else(|_| CString::new("/bin/sh").unwrap());
+    let cmd = CString::new(cmd_str).unwrap_or_else(|_| CString::new("/bin/sh").unwrap());
 
     let mut argv: Vec<CString> = vec![cmd.clone()];
     if args.is_empty() {
@@ -977,6 +1029,7 @@ pub fn kill_session(pid: u32, force: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 /// Discover running coop sessions by scanning /proc/*/environ for COOP_SESSION.
 ///
 /// This is used for:

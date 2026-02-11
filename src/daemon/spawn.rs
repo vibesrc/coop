@@ -31,10 +31,8 @@ pub async fn ensure_daemon() -> Result<()> {
             bail!("Daemon failed to start within 2.5 seconds");
         }
 
-        if sock_path.exists() {
-            if UnixStream::connect(&sock_path).await.is_ok() {
-                return Ok(());
-            }
+        if sock_path.exists() && UnixStream::connect(&sock_path).await.is_ok() {
+            return Ok(());
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -48,15 +46,15 @@ fn spawn_daemon() -> Result<()> {
     let exe = std::env::current_exe().context("Failed to get current executable path")?;
 
     // Use double-fork to detach from terminal
-    match unsafe { fork::fork() } {
+    match fork::fork() {
         Ok(fork::Fork::Parent(_)) => {
             // Parent: return and wait for socket
-            return Ok(());
+            Ok(())
         }
         Ok(fork::Fork::Child) => {
             // Child: setsid and fork again
             let _ = unsafe { nix::libc::setsid() };
-            match unsafe { fork::fork() } {
+            match fork::fork() {
                 Ok(fork::Fork::Parent(_)) => {
                     // Intermediate child: exit
                     std::process::exit(0);
@@ -88,12 +86,14 @@ fn run_daemon_process(exe: &Path) {
         // Re-exec ourselves in daemon mode using an env var marker
         let status = std::process::Command::new(exe)
             .env("COOP_DAEMON_MODE", "1")
-            .stdout(std::fs::File::create(&log_path).unwrap_or_else(|_| {
-                std::fs::File::open("/dev/null").unwrap()
-            }))
-            .stderr(std::fs::File::create(&log_path).unwrap_or_else(|_| {
-                std::fs::File::open("/dev/null").unwrap()
-            }))
+            .stdout(
+                std::fs::File::create(&log_path)
+                    .unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap()),
+            )
+            .stderr(
+                std::fs::File::create(&log_path)
+                    .unwrap_or_else(|_| std::fs::File::open("/dev/null").unwrap()),
+            )
             .spawn();
 
         if let Err(e) = status {

@@ -5,11 +5,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 
-use base64::Engine;
 use crate::ipc::{
     Command, DaemonEvent, MessageCodec, Response, StreamCodec, StreamFrame, VersionHandshake,
     VersionResponse, FRAME_CONTROL, FRAME_PTY_DATA, PROTOCOL_VERSION,
 };
+use base64::Engine;
 
 /// Client for communicating with the coop daemon over the unix socket.
 pub struct DaemonClient {
@@ -112,14 +112,13 @@ impl DaemonClient {
             // If session exists, try attach (use session name from response if available)
             if resp.error.as_deref() == Some("SESSION_EXISTS") {
                 let session_name = resp.data.session.unwrap_or_else(|| {
-                    name.map(|s| s.to_string())
-                        .unwrap_or_else(|| {
-                            std::path::Path::new(workspace)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .to_string()
-                        })
+                    name.map(|s| s.to_string()).unwrap_or_else(|| {
+                        std::path::Path::new(workspace)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string()
+                    })
                 });
                 return self.attach(&session_name, 0).await;
             }
@@ -191,16 +190,18 @@ impl DaemonClient {
                 })
             })
         } else {
-            bail!(
-                "Failed to create box: {}",
-                resp.message.unwrap_or_default()
-            );
+            bail!("Failed to create box: {}", resp.message.unwrap_or_default());
         };
 
         self.shell(&session_name, command, force_new).await
     }
 
-    pub async fn shell(mut self, session: &str, command: Option<&str>, force_new: bool) -> Result<()> {
+    pub async fn shell(
+        mut self,
+        session: &str,
+        command: Option<&str>,
+        force_new: bool,
+    ) -> Result<()> {
         let (cols, rows) = terminal_size();
         let cmd = Command::Shell {
             session: session.to_string(),
@@ -211,7 +212,10 @@ impl DaemonClient {
         };
         let resp = self.send_command(&cmd).await?;
         if !resp.ok {
-            bail!("Failed to spawn shell: {}", resp.message.unwrap_or_default());
+            bail!(
+                "Failed to spawn shell: {}",
+                resp.message.unwrap_or_default()
+            );
         }
 
         if let Some(pty_id) = resp.data.pty {
@@ -223,7 +227,10 @@ impl DaemonClient {
     pub async fn list_sessions(mut self, json: bool) -> Result<()> {
         let resp = self.send_command(&Command::Ls).await?;
         if !resp.ok {
-            bail!("Failed to list sessions: {}", resp.message.unwrap_or_default());
+            bail!(
+                "Failed to list sessions: {}",
+                resp.message.unwrap_or_default()
+            );
         }
 
         if let Some(sessions) = &resp.data.sessions {
@@ -233,8 +240,8 @@ impl DaemonClient {
                 println!("No running boxes.");
             } else {
                 println!(
-                    "{:<12} {:<30} {:<10} {:<6} {:<15} {}",
-                    "BOX", "WORKSPACE", "STATE", "PTYS", "CLIENTS", "AGE"
+                    "{:<12} {:<30} {:<10} {:<6} {:<15} AGE",
+                    "BOX", "WORKSPACE", "STATE", "PTYS", "CLIENTS"
                 );
                 for s in sessions {
                     println!(
@@ -260,7 +267,10 @@ impl DaemonClient {
         };
         let resp = self.send_command(&cmd).await?;
         if !resp.ok {
-            bail!("Failed to kill session: {}", resp.message.unwrap_or_default());
+            bail!(
+                "Failed to kill session: {}",
+                resp.message.unwrap_or_default()
+            );
         }
         println!("Box '{}' killed", session);
         Ok(())
@@ -274,7 +284,10 @@ impl DaemonClient {
         };
         let resp = self.send_command(&cmd).await?;
         if !resp.ok {
-            bail!("Failed to kill sessions: {}", resp.message.unwrap_or_default());
+            bail!(
+                "Failed to kill sessions: {}",
+                resp.message.unwrap_or_default()
+            );
         }
         println!("All boxes killed");
         Ok(())
@@ -294,8 +307,8 @@ impl DaemonClient {
                 println!("No running boxes.");
             } else {
                 println!(
-                    "{:<12} {:<6} {:<8} {:<20} {}",
-                    "BOX", "ID", "ROLE", "COMMAND", "PID"
+                    "{:<12} {:<6} {:<8} {:<20} PID",
+                    "BOX", "ID", "ROLE", "COMMAND"
                 );
                 for s in sessions {
                     for p in &s.ptys {
@@ -334,7 +347,7 @@ impl DaemonClient {
             if ptys.is_empty() {
                 println!("No sessions in box '{}'.", box_name);
             } else {
-                println!("{:<6} {:<8} {:<20} {}", "ID", "ROLE", "COMMAND", "PID");
+                println!("{:<6} {:<8} {:<20} PID", "ID", "ROLE", "COMMAND");
                 for p in ptys {
                     let pid_str = p
                         .pid
@@ -375,7 +388,10 @@ impl DaemonClient {
         };
         let resp = self.send_command(&cmd).await?;
         if !resp.ok {
-            bail!("Failed to start serve: {}", resp.message.unwrap_or_default());
+            bail!(
+                "Failed to start serve: {}",
+                resp.message.unwrap_or_default()
+            );
         }
 
         let token = resp.data.token.unwrap_or_default();
@@ -394,12 +410,7 @@ impl DaemonClient {
         Ok(())
     }
 
-    pub async fn tunnel(
-        mut self,
-        _stun: Option<&str>,
-        _no_stun: bool,
-        _no_qr: bool,
-    ) -> Result<()> {
+    pub async fn tunnel(self, _stun: Option<&str>, _no_stun: bool, _no_qr: bool) -> Result<()> {
         // TODO: implement WebRTC tunnel
         bail!("Tunnel support not yet implemented");
     }
@@ -425,7 +436,7 @@ impl DaemonClient {
         Ok(())
     }
 
-    pub async fn stop_serve(mut self) -> Result<()> {
+    pub async fn stop_serve(self) -> Result<()> {
         // TODO: implement serve stop
         bail!("Serve stop not yet implemented");
     }
@@ -493,11 +504,7 @@ impl DaemonClient {
         // Set terminal to raw mode
         let mut raw = orig_termios.clone();
         nix::sys::termios::cfmakeraw(&mut raw);
-        nix::sys::termios::tcsetattr(
-            &stdin_handle,
-            nix::sys::termios::SetArg::TCSANOW,
-            &raw,
-        )?;
+        nix::sys::termios::tcsetattr(&stdin_handle, nix::sys::termios::SetArg::TCSANOW, &raw)?;
 
         // Consume self to extract the UnixStream, carrying over any buffered
         // bytes (the server may have already sent StreamCodec frames like scrollback
@@ -535,10 +542,7 @@ const ESCAPE_CHAR: u8 = 0x1D;
 
 /// Run the bidirectional stream bridge between local terminal and daemon PTY.
 async fn run_stream_bridge(
-    sink: &mut futures_util::stream::SplitSink<
-        Framed<UnixStream, StreamCodec>,
-        StreamFrame,
-    >,
+    sink: &mut futures_util::stream::SplitSink<Framed<UnixStream, StreamCodec>, StreamFrame>,
     stream: &mut futures_util::stream::SplitStream<Framed<UnixStream, StreamCodec>>,
 ) -> Result<()> {
     let mut stdin = tokio::io::stdin();

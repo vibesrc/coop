@@ -31,7 +31,9 @@ async fn index_handler() -> impl IntoResponse {
     }
 }
 
-async fn static_handler(axum::extract::Path(path): axum::extract::Path<String>) -> impl IntoResponse {
+async fn static_handler(
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> impl IntoResponse {
     let path = format!("assets/{}", path);
     match Asset::get(&path) {
         Some(content) => {

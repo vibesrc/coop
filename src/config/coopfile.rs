@@ -127,7 +127,7 @@ impl MountConfig {
     pub fn is_named_volume(&self) -> bool {
         match self {
             MountConfig::Short(s) => {
-                let left = s.splitn(2, ':').next().unwrap_or("");
+                let left = s.split(':').next().unwrap_or("");
                 !Self::is_path(left)
             }
             MountConfig::Full { host, .. } => !Self::is_path(host),
@@ -140,7 +140,7 @@ impl MountConfig {
             return None;
         }
         match self {
-            MountConfig::Short(s) => Some(s.splitn(2, ':').next().unwrap_or("").to_string()),
+            MountConfig::Short(s) => Some(s.split(':').next().unwrap_or("").to_string()),
             MountConfig::Full { host, .. } => Some(host.clone()),
         }
     }
@@ -182,32 +182,19 @@ impl MountConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkMode {
     None,
+    #[default]
     Host,
     Veth,
 }
 
-impl Default for NetworkMode {
-    fn default() -> Self {
-        NetworkMode::Host
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NetworkConfig {
     #[serde(default)]
     pub mode: NetworkMode,
-}
-
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            mode: NetworkMode::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,8 +263,8 @@ impl Coopfile {
 
     /// Load a Coopfile from a file path
     pub fn load(path: &Path) -> Result<Self> {
-        let content =
-            std::fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read {}", path.display()))?;
         Self::parse(&content)
     }
 
@@ -300,13 +287,17 @@ impl Coopfile {
             self.sandbox.args = other.sandbox.args.clone();
         }
         if !other.sandbox.setup.is_empty() {
-            self.sandbox.setup.extend(other.sandbox.setup.iter().cloned());
+            self.sandbox
+                .setup
+                .extend(other.sandbox.setup.iter().cloned());
         }
         if other.sandbox.user != default_user() {
             self.sandbox.user = other.sandbox.user.clone();
         }
         if !other.sandbox.mounts.is_empty() {
-            self.sandbox.mounts.extend(other.sandbox.mounts.iter().cloned());
+            self.sandbox
+                .mounts
+                .extend(other.sandbox.mounts.iter().cloned());
         }
 
         // Env: additive merge
@@ -385,6 +376,7 @@ impl Coopfile {
     }
 
     /// Resolve the workspace mount path relative to a base directory
+    #[allow(dead_code)]
     pub fn resolve_workspace_mount(&self, base: &Path) -> PathBuf {
         if self.workspace.mount == "." {
             base.to_path_buf()
