@@ -910,6 +910,7 @@ fn child_entrypoint(
     // Set environment
     std::env::set_var("HOME", sandbox_home);
     std::env::set_var("USER", sandbox_user);
+    std::env::set_var("IS_SANDBOX", "1");
     std::env::set_var("TERM", "xterm-256color");
     std::env::set_var(
         "PATH",

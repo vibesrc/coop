@@ -137,6 +137,25 @@ Config layers: defaults < `~/.config/coop/default.toml` < project `coop.toml` < 
 
 4. **Mounts**: Path-based entries (`~/.bashrc:~/.bashrc`) bind-mount from the host. Named entries (`claude-config:~/.claude`) use managed persistent storage that survives box restarts.
 
+## Security model
+
+Coop's sandbox is designed to give AI agents a **full development environment that looks and feels like a real system** — including running as root — while protecting the host filesystem from unintended damage.
+
+**What's isolated:**
+- **Filesystem**: OverlayFS means the agent can `rm -rf /` and the host rootfs is untouched. Writes go to a per-session upper layer.
+- **Mount namespace**: Mounts inside the sandbox don't propagate to the host.
+- **User namespace**: The agent runs as uid 0 (root) inside, mapped to your unprivileged uid on the host. It can install packages, modify system files, etc. — all within the overlay.
+- **Hostname**: Each box gets its own hostname via UTS namespace.
+
+**What's shared (by design):**
+- **Workspace**: Your project directory is bind-mounted read/write. The agent needs to edit your code.
+- **Explicit mounts**: Anything in `coop.toml` `mounts` (e.g. `~/.bashrc`, named volumes) is accessible.
+- **Network** (in `host` mode): The agent shares the host network stack so it can install packages, call APIs, run dev servers, etc.
+
+**Known limitations / TODO:**
+- **No PID namespace**: The agent can see (and signal) host processes owned by your user. This is a side effect of skipping `CLONE_NEWPID` — adding it requires a double-fork after `unshare()` and breaks `lsof`/`ss` port debugging under host networking. Planned improvement: enable PID namespace when `network.mode != "host"`, where port conflicts can't happen.
+- **No seccomp filter**: The agent has full syscall access within its user namespace. A seccomp profile restricting `ptrace`, `process_vm_readv`, `keyctl`, etc. would further harden the sandbox.
+
 ## Requirements
 
 - Linux kernel 5.11+ (user namespaces, overlayfs)

@@ -1,6 +1,6 @@
 [sandbox]
 image = "debian:latest"
-agent = "bash"
+agent = "IS_SANDBOX=1 claude --dangerously-skip-permissions"
 shell = "bash"
 user = "coop"
 
@@ -9,7 +9,7 @@ setup = [
 ]
 
 mounts = [
-  "~/.bashrc:~/.bashrc",       # for bash configuration
+  "~/.bashrc:~/.bashrc",             # for bash configuration
   "~/.local/claude:~/.local/claude", # use local claude binary
-  "claude-config:~/.claude",   # for claude configuration
+  "claude-config:~/.claude",         # for claude configuration
 ]
