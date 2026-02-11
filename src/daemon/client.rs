@@ -499,7 +499,6 @@ impl DaemonClient {
             &raw,
         )?;
 
-
         // Consume self to extract the UnixStream, carrying over any buffered
         // bytes (the server may have already sent StreamCodec frames like scrollback
         // replay that got read-ahead into the MessageCodec's buffer).
@@ -518,6 +517,12 @@ impl DaemonClient {
             nix::sys::termios::SetArg::TCSANOW,
             &orig_termios,
         );
+
+        // Reset terminal modes that PTY programs may have changed:
+        // - Show cursor (\x1b[?25h)
+        // - Disable mouse tracking (\x1b[?1000l\x1b[?1002l\x1b[?1003l)
+        // - Reset attributes (\x1b[0m)
+        eprint!("\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[0m");
 
         eprintln!("[detached]");
 

@@ -35,7 +35,7 @@ mode = "host"
 [session]
 persist = [".claude"]
 auto_restart = true
-restart_delay_ms = 1000
+restart_delay_ms = 100
 
 [input_filter]
 ctrl_c_debounce_ms = 500
@@ -111,7 +111,7 @@ Modes:
 |-------|------|---------|-------------|
 | `persist` | string[] | `[".claude"]` | Directories inside the sandbox to persist across restarts (relative to sandbox home) |
 | `auto_restart` | bool | `true` | Auto-restart the agent when it exits |
-| `restart_delay_ms` | u64 | `1000` | Delay before restarting (ms) |
+| `restart_delay_ms` | u64 | `100` | Delay before restarting (ms) |
 
 When `auto_restart` is enabled, connected clients see a `[process exited, restarting in 1000ms...]` message and then the new process output, without disconnecting.
 

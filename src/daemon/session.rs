@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -8,7 +9,7 @@ use anyhow::{bail, Result};
 use bytes::Bytes;
 use tokio::sync::{broadcast, oneshot, Mutex, RwLock};
 
-use crate::config::{self, Coopfile, NetworkMode};
+use crate::config::{self, Coopfile};
 use base64::Engine;
 use crate::ipc::{
     PtyInfo, PtyRole, Response, ResponseData, SessionInfo, ERR_SESSION_EXISTS,
@@ -26,8 +27,9 @@ pub struct PtyState {
     pub role: PtyRole,
     pub command: String,
     pub pid: Option<u32>,
-    /// PTY master file descriptor (owned by daemon). None if PTY not yet allocated.
-    pub master_fd: Option<RawFd>,
+    /// PTY master file descriptor (owned by daemon). Shared atomically so
+    /// stream handlers always read the current fd after restarts. -1 = closed.
+    pub master_fd: Arc<AtomicI32>,
     /// Broadcast channel for fan-out of PTY output to all attached clients.
     pub output_tx: Option<broadcast::Sender<Bytes>>,
     /// Shared scrollback buffer for replay on re-attach.
@@ -46,7 +48,7 @@ impl PtyState {
             role,
             command,
             pid: Some(pid),
-            master_fd: Some(master_fd),
+            master_fd: Arc::new(AtomicI32::new(master_fd)),
             output_tx: Some(output_tx),
             scrollback: Some(scrollback),
             auto_restart,
@@ -67,8 +69,6 @@ pub struct Session {
     pub web_clients: u32,
     /// Default shell command from config
     pub default_shell: String,
-    /// Whether the session's network is isolated
-    pub network_isolated: bool,
     /// Home directory inside the sandbox
     pub sandbox_home: String,
     /// Sandbox user name
@@ -79,6 +79,29 @@ pub struct Session {
     pub sandbox_workspace: String,
     /// Delay before restarting PTYs with auto_restart (ms)
     pub restart_delay_ms: u64,
+    /// Pinned namespace fds — keep the namespace alive for restart support.
+    /// -1 means not set (e.g. rediscovered sessions without namespace fds).
+    pub ns_user_fd: RawFd,
+    pub ns_mnt_fd: RawFd,
+    pub ns_uts_fd: RawFd,
+    pub ns_net_fd: Option<RawFd>,
+    pub ns_root_fd: RawFd,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // Close pinned namespace fds to release the namespace
+        for fd in [self.ns_user_fd, self.ns_mnt_fd, self.ns_uts_fd, self.ns_root_fd] {
+            if fd >= 0 {
+                unsafe { nix::libc::close(fd); }
+            }
+        }
+        if let Some(fd) = self.ns_net_fd {
+            if fd >= 0 {
+                unsafe { nix::libc::close(fd); }
+            }
+        }
+    }
 }
 
 impl Session {
@@ -242,12 +265,17 @@ impl SessionManager {
                     local_clients: 0,
                     web_clients: 0,
                     default_shell: "/bin/bash".to_string(),
-                    network_isolated: false,
                     sandbox_home: "/home/coop".to_string(),
                     sandbox_user: "coop".to_string(),
                     user_env: vec![],
                     sandbox_workspace: "/workspace".to_string(),
                     restart_delay_ms: 1000,
+                    // Rediscovered sessions don't have pinned fds — restart won't work
+                    ns_user_fd: -1,
+                    ns_mnt_fd: -1,
+                    ns_uts_fd: -1,
+                    ns_net_fd: None,
+                    ns_root_fd: -1,
                 },
             );
         }
@@ -332,7 +360,6 @@ impl SessionManager {
 
         let sandbox_user = config.sandbox.user.clone();
         let sandbox_home = format!("/home/{}", sandbox_user);
-        let network_isolated = config.network.mode != NetworkMode::Host;
         let default_shell = config.sandbox.shell_command().to_string();
         let sandbox_workspace = config.workspace.path.clone();
         let user_env: Vec<(String, String)> = config.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
@@ -359,12 +386,16 @@ impl SessionManager {
             local_clients: 0,
             web_clients: 0,
             default_shell,
-            network_isolated,
             sandbox_home,
             sandbox_user,
             user_env,
             sandbox_workspace,
             restart_delay_ms,
+            ns_user_fd: ns_result.ns_user_fd,
+            ns_mnt_fd: ns_result.ns_mnt_fd,
+            ns_uts_fd: ns_result.ns_uts_fd,
+            ns_net_fd: ns_result.ns_net_fd,
+            ns_root_fd: ns_result.ns_root_fd,
         };
 
         tracing::info!(
@@ -447,17 +478,23 @@ impl SessionManager {
         let pty_id = session.ptys.iter().map(|p| p.id).max().map_or(1, |m| m + 1);
 
         let env_vars = session.user_env.clone();
-        let ns_pid = session.namespace_pid;
-        let network_isolated = session.network_isolated;
+        let ns_user_fd = session.ns_user_fd;
+        let ns_mnt_fd = session.ns_mnt_fd;
+        let ns_uts_fd = session.ns_uts_fd;
+        let ns_net_fd = session.ns_net_fd;
+        let ns_root_fd = session.ns_root_fd;
         let sandbox_user = session.sandbox_user.clone();
         let sandbox_home = session.sandbox_home.clone();
         let sandbox_workspace = session.sandbox_workspace.clone();
 
         let shell_ns = namespace::nsenter_shell(
-            ns_pid,
+            ns_user_fd,
+            ns_mnt_fd,
+            ns_uts_fd,
+            ns_net_fd,
+            ns_root_fd,
             &cmd,
             &env_vars,
-            network_isolated,
             &sandbox_user,
             &sandbox_home,
             &sandbox_workspace,
@@ -513,8 +550,9 @@ impl SessionManager {
             );
         }
 
-        // Close master fd
-        if let Some(fd) = pty.master_fd {
+        // Close master fd (atomic swap to -1)
+        let fd = pty.master_fd.swap(-1, Ordering::SeqCst);
+        if fd >= 0 {
             unsafe { nix::libc::close(fd) };
         }
 
@@ -704,7 +742,8 @@ impl SessionManager {
         }))
     }
 
-    /// Restart a PTY process (agent or shell). Reuses the same broadcast
+    /// Restart a PTY process (agent or shell). Re-reads coop.toml to pick up
+    /// config changes (agent command, env vars, etc.). Reuses the same broadcast
     /// channel and scrollback so connected clients stay connected.
     pub async fn restart_pty(
         self: &Arc<Self>,
@@ -721,30 +760,59 @@ impl SessionManager {
             .find(|p| p.id == pty_id)
             .ok_or_else(|| anyhow::anyhow!("PTY {} not found in session '{}'", pty_id, session_name))?;
 
-        let command = pty.command.clone();
         let old_pid = pty.pid;
-        let old_master_fd = pty.master_fd;
-        let auto_restart = pty.auto_restart;
+        let master_fd_ref = pty.master_fd.clone();
         let output_tx = pty.output_tx.clone()
             .ok_or_else(|| anyhow::anyhow!("PTY {} has no output channel", pty_id))?;
         let scrollback = pty.scrollback.clone()
             .ok_or_else(|| anyhow::anyhow!("PTY {} has no scrollback buffer", pty_id))?;
 
+        // Re-read coop.toml to pick up config changes
+        let workspace_path = PathBuf::from(&session.workspace);
+        let mut config = Coopfile::resolve(&workspace_path, None).unwrap_or_default();
+        config.expand_env();
+
+        // Update session-level settings from fresh config
+        session.default_shell = config.sandbox.shell_command().to_string();
+        session.user_env = config.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        session.restart_delay_ms = config.session.restart_delay_ms;
+
+        // Determine the command: agent (PTY 0) picks up new agent command,
+        // shells keep their original command
+        let command = if pty_id == 0 {
+            let new_cmd = config.sandbox.agent_command().unwrap_or("claude").to_string();
+            new_cmd
+        } else {
+            pty.command.clone()
+        };
+
+        // Update PTY-level settings
+        let auto_restart = if pty_id == 0 {
+            config.session.auto_restart
+        } else {
+            pty.auto_restart
+        };
         let restart_delay_ms = session.restart_delay_ms;
 
-        // nsenter new process FIRST (keeps namespace alive)
+        // nsenter new process using pinned namespace fds (works even after init dies)
         let env_vars = session.user_env.clone();
-        let ns_pid = session.namespace_pid;
-        let network_isolated = session.network_isolated;
+        let ns_user_fd = session.ns_user_fd;
+        let ns_mnt_fd = session.ns_mnt_fd;
+        let ns_uts_fd = session.ns_uts_fd;
+        let ns_net_fd = session.ns_net_fd;
+        let ns_root_fd = session.ns_root_fd;
         let sandbox_user = session.sandbox_user.clone();
         let sandbox_home = session.sandbox_home.clone();
         let sandbox_workspace = session.sandbox_workspace.clone();
 
         let shell_ns = namespace::nsenter_shell(
-            ns_pid,
+            ns_user_fd,
+            ns_mnt_fd,
+            ns_uts_fd,
+            ns_net_fd,
+            ns_root_fd,
             &command,
             &env_vars,
-            network_isolated,
             &sandbox_user,
             &sandbox_home,
             &sandbox_workspace,
@@ -758,9 +826,12 @@ impl SessionManager {
             );
         }
 
-        // Close old master fd
-        if let Some(fd) = old_master_fd {
-            unsafe { nix::libc::close(fd) };
+        // Close old master fd and atomically swap to new fd.
+        // Stream handlers read from the same Arc<AtomicI32>, so they
+        // immediately start writing to the new fd after this.
+        let old_fd = master_fd_ref.swap(shell_ns.pty_master_fd, Ordering::SeqCst);
+        if old_fd >= 0 {
+            unsafe { nix::libc::close(old_fd) };
         }
 
         // Start new pty_reader with SAME output_tx and scrollback
@@ -773,7 +844,8 @@ impl SessionManager {
             .find(|p| p.id == pty_id)
             .unwrap();
         pty.pid = Some(shell_ns.shell_pid);
-        pty.master_fd = Some(shell_ns.pty_master_fd);
+        pty.command = command;
+        pty.auto_restart = auto_restart;
 
         // If this was the agent (PTY 0), update namespace_pid
         if pty_id == 0 {
@@ -810,11 +882,13 @@ impl SessionManager {
 
     /// Get the broadcast sender and master fd for a PTY in a session.
     /// Used by stream mode to bridge client connections to the PTY.
+    /// The master_fd is an `Arc<AtomicI32>` so stream handlers always
+    /// read the current fd even after a PTY restart.
     pub async fn get_pty_handle(
         &self,
         session_name: &str,
         pty_id: u32,
-    ) -> Result<(Option<RawFd>, broadcast::Sender<Bytes>, Option<Arc<Mutex<Vec<u8>>>>)> {
+    ) -> Result<(Arc<AtomicI32>, broadcast::Sender<Bytes>, Option<Arc<Mutex<Vec<u8>>>>)> {
         let sessions = self.sessions.read().await;
         let session = self.resolve_session(&sessions, session_name)?;
 
@@ -829,7 +903,7 @@ impl SessionManager {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("PTY {} has no output channel", pty_id))?;
 
-        Ok((pty.master_fd, output_tx, pty.scrollback.clone()))
+        Ok((pty.master_fd.clone(), output_tx, pty.scrollback.clone()))
     }
 
     /// Increment the local client count for a session

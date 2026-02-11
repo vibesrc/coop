@@ -145,5 +145,5 @@ Create a P2P WebRTC tunnel for remote access. (Coming soon.)
 
 ## Exit behavior
 
-- **Agent (PTY 0)**: If `auto_restart` is enabled (default), the agent is restarted automatically after `restart_delay_ms`. Connected clients see a message and stay connected.
+- **Agent (PTY 0)**: If `auto_restart` is enabled (default), the agent is restarted automatically after `restart_delay_ms` (default 100ms). Connected clients see a brief gap then the new process output, without disconnecting. On restart, the latest `coop.toml` is re-read so config changes (agent command, env vars, etc.) take effect immediately.
 - **Shells (PTY 1+)**: When a shell exits, the PTY is cleaned up and the client returns to the host terminal.

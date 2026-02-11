@@ -1,4 +1,4 @@
-use std::os::unix::io::AsRawFd;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -401,7 +401,8 @@ async fn handle_stream_mode_inner(
 
     // If we have a real master fd and not readonly, set initial window size
     if !target.readonly {
-        if let Some(fd) = master_fd {
+        let fd = master_fd.load(Ordering::SeqCst);
+        if fd >= 0 {
             set_pty_size(fd, target.cols, target.rows);
         }
     }
@@ -426,9 +427,12 @@ async fn handle_stream_mode_inner(
                     Some(Ok(frame)) => {
                         match frame.frame_type {
                             FRAME_PTY_DATA => {
-                                // Write input to PTY master (skip if readonly)
+                                // Write input to PTY master (skip if readonly).
+                                // Read fd atomically so we always use the current
+                                // fd even after a PTY restart.
                                 if !target.readonly {
-                                    if let Some(fd) = master_fd {
+                                    let fd = master_fd.load(Ordering::SeqCst);
+                                    if fd >= 0 {
                                         let data = &frame.payload;
                                         unsafe {
                                             nix::libc::write(
@@ -444,7 +448,8 @@ async fn handle_stream_mode_inner(
                                 match serde_json::from_slice::<Command>(&frame.payload) {
                                     Ok(Command::Resize { cols, rows }) => {
                                         if !target.readonly {
-                                            if let Some(fd) = master_fd {
+                                            let fd = master_fd.load(Ordering::SeqCst);
+                                            if fd >= 0 {
                                                 set_pty_size(fd, cols, rows);
                                             }
                                         }

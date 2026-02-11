@@ -233,7 +233,7 @@ fn default_true() -> bool {
 }
 
 fn default_restart_delay() -> u64 {
-    1000
+    100
 }
 
 impl Default for SessionConfig {
@@ -241,7 +241,7 @@ impl Default for SessionConfig {
         Self {
             persist: default_persist(),
             auto_restart: true,
-            restart_delay_ms: 1000,
+            restart_delay_ms: 100,
         }
     }
 }
@@ -440,7 +440,7 @@ command = "claude"
     fn test_defaults() {
         let cf = Coopfile::default();
         assert_eq!(cf.session.auto_restart, true);
-        assert_eq!(cf.session.restart_delay_ms, 1000);
+        assert_eq!(cf.session.restart_delay_ms, 100);
         assert_eq!(cf.input_filter.ctrl_c_debounce_ms, 500);
         assert_eq!(cf.session.persist, vec![".claude"]);
         assert_eq!(cf.network.mode, NetworkMode::Host);

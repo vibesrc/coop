@@ -112,7 +112,8 @@ async fn handle_socket_inner(
 
                         // Write filtered input to PTY master
                         if !to_forward.is_empty() {
-                            if let Some(fd) = master_fd {
+                            let fd = master_fd.load(std::sync::atomic::Ordering::SeqCst);
+                            if fd >= 0 {
                                 unsafe {
                                     nix::libc::write(
                                         fd,
@@ -129,7 +130,8 @@ async fn handle_socket_inner(
                             if control.get("type").and_then(|t| t.as_str()) == Some("resize") {
                                 let cols = control.get("cols").and_then(|c| c.as_u64()).unwrap_or(120) as u16;
                                 let rows = control.get("rows").and_then(|r| r.as_u64()).unwrap_or(40) as u16;
-                                if let Some(fd) = master_fd {
+                                let fd = master_fd.load(std::sync::atomic::Ordering::SeqCst);
+                                if fd >= 0 {
                                     let ws = nix::libc::winsize {
                                         ws_row: rows,
                                         ws_col: cols,

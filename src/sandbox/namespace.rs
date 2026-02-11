@@ -18,6 +18,13 @@ pub struct SessionNamespace {
     pub pty_master_fd: RawFd,
     /// Session name
     pub name: String,
+    /// Pinned namespace fds — keep these alive so the namespace persists
+    /// even after the init process exits (needed for restart).
+    pub ns_user_fd: RawFd,
+    pub ns_mnt_fd: RawFd,
+    pub ns_uts_fd: RawFd,
+    pub ns_net_fd: Option<RawFd>,
+    pub ns_root_fd: RawFd,
 }
 
 /// Information about a discovered session from /proc scanning
@@ -231,10 +238,36 @@ pub fn create_session(
             let _ = nix::unistd::read(pipe3_rd, &mut buf3);
             unsafe { nix::libc::close(pipe3_rd) };
 
+            // Pin namespace fds open so the namespace persists even after the
+            // init process exits. This allows restart_pty to nsenter later.
+            let child_pid = child.as_raw() as u32;
+            let ns_user_fd = std::fs::File::open(format!("/proc/{}/ns/user", child_pid))
+                .context("Failed to pin user namespace fd")?.into_raw_fd();
+            let ns_mnt_fd = std::fs::File::open(format!("/proc/{}/ns/mnt", child_pid))
+                .context("Failed to pin mount namespace fd")?.into_raw_fd();
+            let ns_uts_fd = std::fs::File::open(format!("/proc/{}/ns/uts", child_pid))
+                .context("Failed to pin UTS namespace fd")?.into_raw_fd();
+            let ns_net_fd = if network_mode != NetworkMode::Host {
+                Some(std::fs::File::open(format!("/proc/{}/ns/net", child_pid))
+                    .context("Failed to pin net namespace fd")?.into_raw_fd())
+            } else {
+                None
+            };
+            let ns_root_fd = nix::fcntl::open(
+                format!("/proc/{}/root", child_pid).as_str(),
+                nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_DIRECTORY,
+                nix::sys::stat::Mode::empty(),
+            ).context("Failed to pin namespace root fd")?;
+
             Ok(SessionNamespace {
-                child_pid: child.as_raw() as u32,
+                child_pid,
                 pty_master_fd: master_fd,
                 name: name.to_string(),
+                ns_user_fd,
+                ns_mnt_fd,
+                ns_uts_fd,
+                ns_net_fd,
+                ns_root_fd,
             })
         }
         ForkResult::Child => {
@@ -750,45 +783,21 @@ pub struct ShellNamespace {
 
 /// Enter an existing session's namespaces and spawn a shell with its own PTY.
 ///
-/// Opens the namespace fds and /proc/<pid>/root BEFORE setns(mnt) so we still
-/// have access to host procfs. Uses fchdir+chroot(".") to enter the sandboxed root.
+/// Uses pre-opened (pinned) namespace fds from session creation. These fds keep
+/// the namespace alive even after the original init process exits — critical for
+/// restart support. Uses fchdir+chroot(".") to enter the sandboxed root.
 pub fn nsenter_shell(
-    namespace_pid: u32,
+    ns_user_fd: RawFd,
+    ns_mnt_fd: RawFd,
+    ns_uts_fd: RawFd,
+    ns_net_fd: Option<RawFd>,
+    ns_root_fd: RawFd,
     shell_cmd: &str,
     env_vars: &[(String, String)],
-    network_isolated: bool,
     sandbox_user: &str,
     sandbox_home: &str,
     cwd: &str,
 ) -> Result<ShellNamespace> {
-    let pid = namespace_pid;
-
-    // Open namespace fds BEFORE fork (while we're on host).
-    // user ns MUST be entered first — can't setns(mnt) into a user
-    // namespace's mount namespace without being in that user namespace.
-    let user_ns = std::fs::File::open(format!("/proc/{}/ns/user", pid))
-        .context("Failed to open user namespace")?;
-    let mnt_ns = std::fs::File::open(format!("/proc/{}/ns/mnt", pid))
-        .context("Failed to open mnt namespace")?;
-    let uts_ns = std::fs::File::open(format!("/proc/{}/ns/uts", pid))
-        .context("Failed to open uts namespace")?;
-    let net_ns = if network_isolated {
-        Some(
-            std::fs::File::open(format!("/proc/{}/ns/net", pid))
-                .context("Failed to open net namespace")?,
-        )
-    } else {
-        None
-    };
-
-    // Open /proc/<pid>/root BEFORE entering mount namespace
-    let root_fd = nix::fcntl::open(
-        format!("/proc/{}/root", pid).as_str(),
-        nix::fcntl::OFlag::O_RDONLY | nix::fcntl::OFlag::O_DIRECTORY,
-        nix::sys::stat::Mode::empty(),
-    )
-    .context("Failed to open namespace root")?;
-
     // Allocate PTY pair
     let pty = nix::pty::openpty(None, None).context("Failed to allocate PTY for shell")?;
     let master_fd = pty.master.into_raw_fd();
@@ -802,13 +811,8 @@ pub fn nsenter_shell(
 
     match unsafe { nix::unistd::fork() }.context("fork() failed for nsenter_shell")? {
         ForkResult::Parent { child } => {
-            // Parent: close slave fd and namespace fds
+            // Parent: close slave fd only. Namespace fds belong to Session — don't touch.
             unsafe { nix::libc::close(slave_fd) };
-            unsafe { nix::libc::close(root_fd) };
-            drop(user_ns);
-            drop(mnt_ns);
-            drop(uts_ns);
-            drop(net_ns);
 
             Ok(ShellNamespace {
                 shell_pid: child.as_raw() as u32,
@@ -818,6 +822,14 @@ pub fn nsenter_shell(
         ForkResult::Child => {
             // Child: close master fd
             unsafe { nix::libc::close(master_fd) };
+
+            // Wrap inherited namespace fds in File for RAII (close-on-drop).
+            // After fork, the child has its own fd table — closing here
+            // doesn't affect the parent's copies.
+            let user_ns = unsafe { std::fs::File::from_raw_fd(ns_user_fd) };
+            let mnt_ns = unsafe { std::fs::File::from_raw_fd(ns_mnt_fd) };
+            let uts_ns = unsafe { std::fs::File::from_raw_fd(ns_uts_fd) };
+            let net_ns = ns_net_fd.map(|fd| unsafe { std::fs::File::from_raw_fd(fd) });
 
             // Enter namespaces — user ns FIRST so we have the right
             // credential context for the other namespace operations
@@ -840,18 +852,18 @@ pub fn nsenter_shell(
                 }
             }
 
-            // Close namespace fds (no longer needed)
+            // Close namespace fds (no longer needed after setns)
             drop(user_ns);
             drop(mnt_ns);
             drop(uts_ns);
             drop(net_ns);
 
             // Enter the sandbox root via fchdir + chroot(".")
-            if unsafe { nix::libc::fchdir(root_fd) } != 0 {
+            if unsafe { nix::libc::fchdir(ns_root_fd) } != 0 {
                 eprintln!("coop: fchdir to namespace root failed");
                 std::process::exit(1);
             }
-            unsafe { nix::libc::close(root_fd) };
+            unsafe { nix::libc::close(ns_root_fd) };
 
             if let Err(e) = nix::unistd::chroot(".") {
                 eprintln!("coop: chroot failed: {}", e);
