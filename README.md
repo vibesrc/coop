@@ -45,11 +45,8 @@ coop build                  # pulls base image + builds rootfs
 
 # Start working
 coop                        # creates a box, attaches to the agent
-```
+# Press Ctrl+] to detach — the agent keeps running
 
-Press `Ctrl+]` to detach. The agent keeps running.
-
-```bash
 coop shell                  # open a shell inside the same box
 coop attach                 # reattach to the agent
 coop kill                   # tear it all down
