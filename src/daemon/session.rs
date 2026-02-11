@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Result};
 use bytes::Bytes;
@@ -36,6 +36,8 @@ pub struct PtyState {
     pub scrollback: Option<Arc<Mutex<Vec<u8>>>>,
     /// Whether this PTY auto-restarts on exit
     pub auto_restart: bool,
+    /// Consecutive fast failures counter (for crash loop detection)
+    pub fast_failures: Arc<AtomicU32>,
 }
 
 impl PtyState {
@@ -59,6 +61,7 @@ impl PtyState {
             output_tx: Some(output_tx),
             scrollback: Some(scrollback),
             auto_restart,
+            fast_failures: Arc::new(AtomicU32::new(0)),
         };
         (state, exit_rx)
     }
@@ -394,6 +397,7 @@ impl SessionManager {
             auto_restart,
         );
         let output_tx = agent_pty.output_tx.clone().unwrap();
+        let fast_failures = agent_pty.fast_failures.clone();
 
         let session = Session {
             name: name.clone(),
@@ -435,6 +439,8 @@ impl SessionManager {
             output_tx,
             auto_restart,
             restart_delay_ms,
+            fast_failures,
+            Instant::now(),
         );
 
         Ok(Response::ok_with(ResponseData {
@@ -529,6 +535,7 @@ impl SessionManager {
             false,
         );
         let output_tx = shell_pty.output_tx.clone().unwrap();
+        let fast_failures = shell_pty.fast_failures.clone();
         session.ptys.push(shell_pty);
         drop(sessions);
 
@@ -540,6 +547,8 @@ impl SessionManager {
             output_tx,
             false,
             0,
+            fast_failures,
+            Instant::now(),
         );
 
         Ok(Response::ok_with(ResponseData {
@@ -880,6 +889,7 @@ impl SessionManager {
         pty.pid = Some(shell_ns.shell_pid);
         pty.command = command;
         pty.auto_restart = auto_restart;
+        let fast_failures = pty.fast_failures.clone();
 
         // If this was the agent (PTY 0), update namespace_pid
         if pty_id == 0 {
@@ -897,6 +907,8 @@ impl SessionManager {
             output_tx,
             auto_restart,
             restart_delay_ms,
+            fast_failures,
+            Instant::now(),
         );
 
         tracing::info!(
@@ -987,9 +999,15 @@ impl SessionManager {
             .and_then(|p| p.pid)
     }
 
+    /// Max consecutive fast failures before giving up on auto-restart.
+    const MAX_FAST_FAILURES: u32 = 3;
+    /// A process that exits within this duration counts as a "fast failure".
+    const FAST_FAILURE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
     /// Spawn a background task that watches for a PTY to exit.
     /// If auto_restart is true, restarts the process after a delay.
-    /// Otherwise, cleans up the dead PTY.
+    /// Detects crash loops: if the process exits within 5s three times in a row,
+    /// auto-restart is disabled with a clear error message.
     #[allow(clippy::too_many_arguments)]
     fn spawn_exit_watcher(
         self: &Arc<Self>,
@@ -1000,6 +1018,8 @@ impl SessionManager {
         output_tx: broadcast::Sender<Bytes>,
         auto_restart: bool,
         restart_delay_ms: u64,
+        fast_failures: Arc<AtomicU32>,
+        start_time: Instant,
     ) {
         let sm = Arc::clone(self);
         tokio::spawn(async move {
@@ -1011,6 +1031,30 @@ impl SessionManager {
             }
 
             if auto_restart {
+                // Crash loop detection: if the process died very quickly, count it
+                let uptime = start_time.elapsed();
+                if uptime < Self::FAST_FAILURE_THRESHOLD {
+                    let failures = fast_failures.fetch_add(1, Ordering::SeqCst) + 1;
+                    if failures >= Self::MAX_FAST_FAILURES {
+                        let msg = format!(
+                            "\r\n\x1b[1;31m[process crashed {} times in a row — stopping auto-restart]\x1b[0m\r\n\
+                             \x1b[2mThe command may not exist in the sandbox. Check your coop.toml mounts.\x1b[0m\r\n\
+                             \x1b[2mUse `coop restart` to try again.\x1b[0m\r\n",
+                            failures
+                        );
+                        let _ = output_tx.send(Bytes::from(msg));
+                        tracing::error!(
+                            session = %session_name, pty = pty_id,
+                            "Crash loop detected ({} fast failures), disabling auto-restart",
+                            failures
+                        );
+                        return;
+                    }
+                } else {
+                    // Process ran long enough — reset the counter
+                    fast_failures.store(0, Ordering::SeqCst);
+                }
+
                 let msg = format!(
                     "\r\n\x1b[2m[process exited, restarting in {}ms...]\x1b[0m\r\n",
                     restart_delay_ms

@@ -460,6 +460,7 @@ setup = [
 
 mounts = [
   "claude-config:~/.claude",
+  "~/.local/bin/claude:~/.local/bin/claude",
 ]
 "#;
 

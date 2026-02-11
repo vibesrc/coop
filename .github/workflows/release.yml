@@ -79,6 +79,6 @@ jobs:
         run: mkdir -p web/dist
 
       - name: Publish to crates.io
-        run: cargo publish
+        run: cargo publish --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
