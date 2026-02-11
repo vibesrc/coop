@@ -23,6 +23,12 @@ Coop runs AI coding agents (Claude Code, Codex, Aider, etc.) in an isolated sand
 curl -fsSL https://raw.githubusercontent.com/vibesrc/coop/main/install.sh | sh
 ```
 
+### From crates.io
+
+```bash
+cargo install coop
+```
+
 ### From source
 
 ```bash
