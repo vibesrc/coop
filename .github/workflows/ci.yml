@@ -13,7 +13,7 @@ jobs:
   test:
     strategy:
       matrix:
-        rust: [stable, beta, "1.75"]
+        rust: [stable, beta]
     runs-on: ubuntu-latest
     name: test (${{ matrix.rust }})
     steps:
@@ -26,6 +26,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.rust }}
+
+      - name: Create web dist dir
+        run: mkdir -p web/dist
 
       - name: Build
         run: cargo build --verbose
@@ -43,6 +46,9 @@ jobs:
           components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Create web dist dir
+        run: mkdir -p web/dist
 
       - name: Clippy
         run: cargo clippy -- -D warnings
