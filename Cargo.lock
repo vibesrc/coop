@@ -322,42 +322,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
-name = "coop"
-version = "0.1.0"
-dependencies = [
- "aho-corasick",
- "anyhow",
- "axum",
- "axum-extra",
- "base64",
- "bytes",
- "clap",
- "dirs",
- "fork",
- "futures-util",
- "mime_guess",
- "nix",
- "procfs",
- "qrcode",
- "rand",
- "rust-embed",
- "self_update",
- "serde",
- "serde_json",
- "shellexpand",
- "thiserror",
- "tokio",
- "tokio-tungstenite 0.26.2",
- "tokio-util",
- "toml",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1242,6 +1206,42 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "opencoop"
+version = "0.1.1"
+dependencies = [
+ "aho-corasick",
+ "anyhow",
+ "axum",
+ "axum-extra",
+ "base64",
+ "bytes",
+ "clap",
+ "dirs",
+ "fork",
+ "futures-util",
+ "mime_guess",
+ "nix",
+ "procfs",
+ "qrcode",
+ "rand",
+ "rust-embed",
+ "self_update",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tokio-util",
+ "toml",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "option-ext"

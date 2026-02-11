@@ -26,7 +26,7 @@ curl -fsSL https://raw.githubusercontent.com/vibesrc/coop/main/install.sh | sh
 ### From crates.io
 
 ```bash
-cargo install coop
+cargo install opencoop
 ```
 
 ### From source

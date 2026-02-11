@@ -1,10 +1,15 @@
 [package]
-name = "coop"
-version = "0.1.0"
+name = "opencoop"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.75"
 description = "Sandboxed AI agent sessions with remote access"
 license = "MIT"
+repository = "https://github.com/vibesrc/coop"
+
+[[bin]]
+name = "coop"
+path = "src/main.rs"
 
 [dependencies]
 # CLI
