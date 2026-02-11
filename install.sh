@@ -58,13 +58,28 @@ main() {
         echo "Installed coop to ${install_dir}/coop"
     fi
 
-    # Check if install_dir is in PATH
+    # Add install_dir to PATH in shell profile if not already there
     case ":$PATH:" in
         *":${install_dir}:"*) ;;
         *)
-            echo ""
-            echo "NOTE: ${install_dir} is not in your PATH."
-            echo "Add it with:  export PATH=\"${install_dir}:\$PATH\""
+            line="export PATH=\"${install_dir}:\$PATH\""
+            added=false
+            for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+                if [ -f "$rc" ]; then
+                    if ! grep -qF "$install_dir" "$rc"; then
+                        printf '\n# Added by coop installer\n%s\n' "$line" >> "$rc"
+                        added=true
+                    fi
+                fi
+            done
+            if [ "$added" = true ]; then
+                echo "Added ${install_dir} to PATH in your shell profile."
+                echo "Restart your shell or run:  source ~/.bashrc"
+            else
+                echo ""
+                echo "NOTE: ${install_dir} is not in your PATH."
+                echo "Add it with:  $line"
+            fi
             ;;
     esac
 }
