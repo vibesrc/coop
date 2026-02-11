@@ -50,10 +50,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Self-update
-self_update = { version = "0.42", features = ["archive-tar", "compression-flate2"] }
-
-# TLS (vendored for cross-compilation)
-openssl = { version = "0.10", features = ["vendored"] }
+self_update = { version = "0.42", default-features = false, features = ["archive-tar", "compression-flate2", "rustls"] }
 
 # Misc
 anyhow = "1"
