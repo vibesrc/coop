@@ -15,12 +15,29 @@ Coop runs AI coding agents (Claude Code, Codex, Aider, etc.) in an isolated sand
 
 **One binary. No containers. Sub-100ms startup.**
 
+## Install
+
+### Quick install (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vibesrc/coop/main/install.sh | sh
+```
+
+### From source
+
+```bash
+cargo install --path .
+```
+
+### Update
+
+```bash
+coop update
+```
+
 ## Quick start
 
 ```bash
-# Build from source
-cargo build --release
-
 # Initialize a project
 cd ~/my-project
 coop init                   # creates coop.toml

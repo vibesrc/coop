@@ -165,6 +165,13 @@ pub enum Commands {
 
     /// Restart the agent process (PTY 0)
     Restart,
+
+    /// Update coop to the latest release
+    Update {
+        /// Check for updates without installing
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -414,6 +421,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             let client = crate::daemon::client::DaemonClient::connect().await?;
             client.restart(&box_name, 0).await?;
         }
+        Some(Commands::Update { check }) => {
+            cmd_update(check)?;
+        }
     }
 
     Ok(())
@@ -651,6 +661,46 @@ async fn cmd_system(action: SystemAction) -> Result<()> {
             }
             if !removed {
                 println!("Nothing to remove.");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_update(check: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let updater = self_update::backends::github::Update::configure()
+        .repo_owner("vibesrc")
+        .repo_name("coop")
+        .bin_name("coop")
+        .target(self_update::get_target())
+        .current_version(current)
+        .show_download_progress(true)
+        .no_confirm(true)
+        .build()?;
+
+    if check {
+        match updater.get_latest_release() {
+            Ok(latest) => {
+                println!("Current: v{}", current);
+                println!("Latest:  {}", latest.version);
+                if latest.version == current {
+                    println!("Already up to date.");
+                }
+            }
+            Err(e) => {
+                println!("Current: v{}", current);
+                println!("Could not check for updates: {}", e);
+            }
+        }
+    } else {
+        match updater.update() {
+            Ok(status) => {
+                println!("Updated to v{}!", status.version());
+            }
+            Err(e) => {
+                eprintln!("Update failed: {}", e);
+                return Err(e.into());
             }
         }
     }

@@ -2,6 +2,7 @@
 name = "coop"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 description = "Sandboxed AI agent sessions with remote access"
 license = "MIT"
 
@@ -47,6 +48,9 @@ qrcode = "0.14"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Self-update
+self_update = { version = "0.42", features = ["archive-tar", "compression-flate2"] }
 
 # Misc
 anyhow = "1"
